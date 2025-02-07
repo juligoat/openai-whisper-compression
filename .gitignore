@@ -139,3 +139,13 @@ cython_debug/
 
 # Exclude .DS_Store files from being added
 .DS_Store
+
+# Models and data
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+
+# Results
+quantization/results/*
+!quantization/results/.gitkeep
