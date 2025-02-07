@@ -1,0 +1,109 @@
+[project]
+name = "openai-whisper-compression"
+version = "0.0.1"
+description = "Master Thesis on compression research"
+authors = [{ name = "Julian Irigoyen", email = "juir23ab@student.cbs.dk" }]
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+
+[tool.uv]
+dev-dependencies = [
+    "deptry",
+    "ipykernel",
+    "ipywidgets",
+    "pre-commit",
+    "pytest",
+    "pytest-cookies",
+    "pytest-cov",
+    "ruff",
+    "tox",
+    "vulture",
+    "pytest-cov",
+    "mypy",
+    ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.mypy]
+files = ["openai_whisper_compression", "tests"]
+disallow_untyped_defs = true
+disallow_any_unimported = false
+no_implicit_optional = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+show_error_codes = true
+ignore_missing_imports = true
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = """
+    --cov=openai_whisper_compression
+    --cov-config=pyproject.toml
+    --cov-report=term
+    --cov-report=lcov:lcov.info
+"""
+
+[tool.ruff]
+target-version = "py38"
+exclude = ["vulture_whitelist.py"]
+line-length = 100
+fix = true
+
+[tool.ruff.lint]
+select = [
+    # flake8-2020
+    "YTT",
+    # flake8-bandit
+    "S",
+    # flake8-bugbear
+    "B",
+    # flake8-builtins
+    "A",
+    # flake8-comprehensions
+    "C4",
+    # flake8-debugger
+    "T10",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # mccabe
+    "C90",
+    # pycodestyle
+    "E",
+    "W",
+    # pyflakes
+    "F",
+    # pygrep-hooks
+    "PGH",
+    # pyupgrade
+    "UP",
+    # ruff
+    "RUF",
+    # tryceratops
+    "TRY",
+]
+ignore = [
+    # LineTooLong
+    "E501",
+    # DoNotAssignLambda
+    "E731",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.coverage.report]
+skip_empty = true
+
+[tool.coverage.run]
+branch = true
+source = ["openai_whisper_compression"]
+
+[tool.vulture]
+paths = ["openai_whisper_compression", "vulture_whitelist.py"]
+sort_by_size = true

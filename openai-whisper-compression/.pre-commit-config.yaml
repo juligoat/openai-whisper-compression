@@ -1,0 +1,52 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: "v4.6.0"
+    hooks:
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+        exclude: requirements.txt
+      - id: trailing-whitespace
+  - repo: https://github.com/charliermarsh/ruff-pre-commit
+    rev: "v0.6.5"
+    hooks:
+      - id: ruff
+      - id: ruff-format
+  - repo: https://github.com/jendrikseipp/vulture
+    rev: "v2.11"
+    hooks:
+      - id: vulture
+  - repo: https://github.com/fpgmaas/deptry.git
+    rev: "0.20.0"
+    hooks:
+      - id: deptry
+        name: deptry
+        entry: .venv/bin/deptry .
+        language: system
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: uv-sync
+        name: uv-sync
+        entry: uv sync --locked
+        language: system
+        pass_filenames: false
+      - id: uv-export
+        name: uv-export
+        entry: bash -c 'uv export --locked --no-dev --format requirements-txt > requirements.txt'
+        language: system
+        pass_filenames: false
+      - id: mypy
+        name: mypy
+        entry: .venv/bin/mypy
+        language: system
+        types: [python]
+        args: ["--config-file", "pyproject.toml"]
+        pass_filenames: false
+
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: "v4.0.0-alpha.8"
+    hooks:
+      - id: prettier
