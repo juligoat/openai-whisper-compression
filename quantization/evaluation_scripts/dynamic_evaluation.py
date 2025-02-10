@@ -169,10 +169,10 @@ def main():
 
     # Load and process test data 2620-2939
     dataset_clean = load_librispeech(
-        num_samples=2620, split="test.clean"
+        num_samples=200, split="test.clean"
     )  # Adjust number of samples as needed
     dataset_other = load_librispeech(
-        num_samples=2939, split="test.other"
+        num_samples=200, split="test.other"
     )  # Adjust number of samples as needed
     processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
     processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))

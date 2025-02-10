@@ -77,7 +77,9 @@ def load_librispeech(num_samples=None, split="test.clean"):
     """
     if num_samples:
         # Stream partial dataset
-        stream_dataset = datasets.load_dataset("librispeech_asr", split=split, streaming=True)
+        stream_dataset = datasets.load_dataset(
+            "librispeech_asr", split=split, streaming=True, trust_remote_code=True
+        )
         dataset = datasets.Dataset.from_dict(
             {
                 k: [sample[k] for sample in list(stream_dataset.take(num_samples))]
@@ -150,7 +152,7 @@ def main():
 
     # Load and process test data
     dataset = load_librispeech(
-        num_samples=2939, split="test.other"
+        num_samples=200, split="test.other"
     )  # Adjust number of samples as needed
     processed_test_data = dataset.map(lambda x: map_to_feats(x, processor))
 
