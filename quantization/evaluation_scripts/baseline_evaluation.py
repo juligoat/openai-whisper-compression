@@ -150,35 +150,57 @@ def main():
     model.config.forced_decoder_ids = None
     processor = WhisperProcessor.from_pretrained(args.model)
 
-    # Load and process test data
-    dataset = load_librispeech(
+# Load and process test data 2620-2939
+    dataset_clean = load_librispeech(
+        num_samples=200, split="test.clean"
+    )  # Adjust number of samples as needed
+    dataset_other = load_librispeech(
         num_samples=200, split="test.other"
     )  # Adjust number of samples as needed
-    processed_test_data = dataset.map(lambda x: map_to_feats(x, processor))
+    processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
+    processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
 
     # Initialize metrics
     metrics = {"WER": load("wer"), "CER": load("cer")}
 
     print("Evaluating baseline float model:")
-    float_scores, float_transcriptions = evaluate_model(
-        model, processor, processed_test_data, metrics, args.batch_size
+    float_clean_scores, float_clean_transcriptions = evaluate_model(
+        model, processor, processed_test_data_clean, metrics, args.batch_size
     )
+    float_other_scores, float_other_transcriptions = evaluate_model(
+        model, processor, processed_test_data_clean, metrics, args.batch_size
+    )
+
     float_model_size = get_model_disk_size_in_mb(model)
     print(f"Float model size: {float_model_size:.2f} MB")
 
     # Save metrics and transcriptions
-    float_metrics = {
-        "metrics": float_scores,
+    float_clean_metrics = {
+        "metrics": float_clean_scores,
         "model_size_mb": float_model_size,
         "model_type": "float",
         "model_name": args.model,
     }
 
-    with open(os.path.join(args.save_path, "float_metrics.json"), "w") as f:
-        json.dump(float_metrics, f, indent=2)
+    # Save metrics and transcriptions
+    float_other_metrics = {
+        "metrics": float_other_scores,
+        "model_size_mb": float_model_size,
+        "model_type": "float",
+        "model_name": args.model,
+    }
 
-    with open(os.path.join(args.save_path, "float_transcriptions.json"), "w") as f:
-        json.dump(float_transcriptions, f, indent=2)
+    with open(os.path.join(args.save_path, "float_clean_metrics.json"), "w") as f:
+        json.dump(float_clean_metrics, f, indent=2)
+
+    with open(os.path.join(args.save_path, "float_clean_transcriptions.json"), "w") as f:
+        json.dump(float_clean_transcriptions, f, indent=2)
+
+    with open(os.path.join(args.save_path, "float_other_metrics.json"), "w") as f:
+        json.dump(float_other_metrics, f, indent=2)
+
+    with open(os.path.join(args.save_path, "float_other_transcriptions.json"), "w") as f:
+        json.dump(float_other_transcriptions, f, indent=2)
 
 
 if __name__ == "__main__":

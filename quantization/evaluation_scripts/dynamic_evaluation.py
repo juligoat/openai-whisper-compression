@@ -180,7 +180,6 @@ def main():
     # Initialize metrics
     metrics = {"WER": load("wer"), "CER": load("cer")}
 
-    # EVALUATE QINT4
     print("Evaluating qint4 model:")
     qint4_clean_scores, qint4_clean_transcriptions = evaluate_model(
         qmodel_int4, processor, processed_test_data_clean, metrics, args.batch_size
@@ -188,6 +187,7 @@ def main():
     qint4_other_scores, qint4_other_transcriptions = evaluate_model(
         qmodel_int4, processor, processed_test_data_other, metrics, args.batch_size
     )
+    
     qint4_model_size = get_model_disk_size_in_mb(qmodel_int4)
     print(f"qint4 model size: {qint4_model_size:.2f} MB")
 
