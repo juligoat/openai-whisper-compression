@@ -121,7 +121,7 @@ def main():
         "--batch_size", type=int, default=2, help="The batch size to use for evaluation."
     )
     parser.add_argument(
-        "--device", type=str, default="cpu", help="The device to use for evaluation."
+        "--device", type=str, default=None, help="The device to use for evaluation."
     )
     parser.add_argument("--save_path", type=str, default="results", help="Path to save results")
     args = parser.parse_args()
@@ -146,9 +146,6 @@ def main():
             print("USING CPU")
     else:
         device = torch.device(args.device)
-
-    print("USING CPU")
-    torch.backends.quantized.engine = "qnnpack"
 
     model = WhisperForConditionalGeneration.from_pretrained(args.model).to(device)
     model.config.forced_decoder_ids = None
