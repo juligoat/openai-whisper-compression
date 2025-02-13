@@ -135,10 +135,10 @@ def main():
     torch.manual_seed(args.seed)
 
     if args.device is None:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            print("USING CUDA")
-        elif torch.backends.mps.is_available():
+        #if torch.cuda.is_available():
+        #    device = torch.device("cuda")
+        #    print("USING CUDA")
+        if torch.backends.mps.is_available():
             device = torch.device("mps")
             print("USING MPS")
         else:
