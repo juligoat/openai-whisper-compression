@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 
 import torch
-from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq, BitsAndBytesConfig
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, BitsAndBytesConfig
 
 # Print CUDA availability
 print(f"CUDA available: {torch.cuda.is_available()}")
 
-model_id = "openai/whisper-large-v2"
+model_id = "openai/whisper-small"
 
 # Configure 4-bit quantization
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
     bnb_4bit_use_double_quant=True,
     bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    bnb_4bit_compute_dtype=torch.bfloat16,
 )
 
 # Load processor (tokenizer + feature extractor)
