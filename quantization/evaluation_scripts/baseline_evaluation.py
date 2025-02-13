@@ -168,7 +168,7 @@ def main():
         model, processor, processed_test_data_clean, metrics, args.batch_size
     )
     float_other_scores, float_other_transcriptions = evaluate_model(
-        model, processor, processed_test_data_clean, metrics, args.batch_size
+        model, processor, processed_test_data_other, metrics, args.batch_size
     )
 
     float_model_size = get_model_disk_size_in_mb(model)
