@@ -9,7 +9,8 @@ import seaborn as sns
 import torch
 from jiwer import cer, wer
 from tqdm.notebook import tqdm
-from whisper_quantization_pkg.config import ProjectConfig
+
+from openai_whisper_compression.config import ProjectConfig
 
 
 class ModelProfiler:
