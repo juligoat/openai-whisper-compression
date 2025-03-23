@@ -215,7 +215,7 @@ def load_whisper_model(model_name, device, quantization=None, use_fp16=False):
         if is_immovable_quantization:
             print(f"Loading with device_map='auto' as {quantization} doesn't support moving models")
             model = WhisperForConditionalGeneration.from_pretrained(
-                model_name, quantization_config=quant_config, device_map="cpu"
+                model_name, quantization_config=quant_config, device_map="auto"
             )
         else:
             # Load without device_map for other methods
@@ -391,7 +391,7 @@ def main():
     batch_size = 16
     save_path = "results"
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    device = torch.device("cpu")
+    #device = torch.device("cpu")
     print(f"Using {device}")
 
     if not os.path.exists(save_path):
@@ -446,8 +446,8 @@ def main():
     processor = WhisperProcessor.from_pretrained(original_model_name)
     
     # Load full datasets
-    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")
-    dataset_other = load_librispeech(num_samples=2939, split="test.other")
+    dataset_clean = load_librispeech(num_samples=100, split="test.clean")
+    dataset_other = load_librispeech(num_samples=100, split="test.other")
 
     # Calculate 10% for calibration (approximately 300 samples)
     n_calibration_clean = len(dataset_clean) // 10  # ~262 samples
