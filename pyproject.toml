@@ -13,7 +13,7 @@ dependencies = [
     "asttokens==3.0.0",
     "attrs==24.2.0",
     "audioread==3.0.1",
-    "bitsandbytes==0.42.0",
+    "bitsandbytes==0.43.2",
     "certifi==2024.8.30",
     "cffi==1.17.1",
     "charset-normalizer==3.4.0",
@@ -119,6 +119,7 @@ dependencies = [
     "accelerate>=1.3.0",
     "ctranslate2>=4.5.0",
     "openai-whisper>=20240930",
+    "hqq>=0.2.5",
 ]
 
 [tool.uv]
