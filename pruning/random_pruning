@@ -31,6 +31,83 @@ MODELS_DIR = os.path.join(RANDOM_PRUNING_DIR, "models")
 for directory in [RESULTS_DIR, RANDOM_PRUNING_DIR, PLOTS_DIR, MODELS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
+def calculate_model_gflops(model):
+    """
+    Calculate approximate GFLOPs for Whisper model accounting for pruning.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+
+    Returns:
+        float: Estimated GFLOPs
+    """
+    # Track FLOPs by module type
+    flops_by_type = {
+        "encoder": 0,
+        "decoder": 0,
+        "other": 0
+    }
+
+    total_params = 0
+    non_zero_params = 0
+
+    # Analyze linear layers (where most computation happens)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            if not hasattr(module, 'weight'):
+                continue
+
+            # Get layer dimensions
+            in_features = module.in_features
+            out_features = module.out_features
+
+            # Calculate theoretical FLOPs for this layer (multiply-add operations)
+            # Each output element requires in_features multiplications and in_features-1 additions
+            weight = module.weight
+
+            # Calculate sparsity and non-zero operations
+            weight_sparsity = torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
+            non_zero_ops = 2 * in_features * out_features * (1 - weight_sparsity)
+
+            # Categorize by location in model
+            if "encoder" in name:
+                flops_by_type["encoder"] += non_zero_ops
+            elif "decoder" in name:
+                flops_by_type["decoder"] += non_zero_ops
+            else:
+                flops_by_type["other"] += non_zero_ops
+
+            # Track parameter stats
+            total_params += weight.numel()
+            non_zero_params += (weight != 0).sum().item()
+
+    # For a typical forward pass and generation in Whisper:
+    # 1. Encoder processes the input once
+    # 2. Decoder runs multiple times (typically sequence length)
+    # Simplified assumption: avg sequence length of 25 tokens
+    avg_sequence_length = 25
+    total_flops = flops_by_type["encoder"] + avg_sequence_length * flops_by_type["decoder"] + flops_by_type["other"]
+
+    # Convert to GFLOPs
+    total_gflops = total_flops / 1e9
+
+    # Print detailed breakdown
+    print("\nEstimated GFLOPs by component:")
+    for component, flops in flops_by_type.items():
+        gflops = flops / 1e9
+        percentage = (flops / sum(flops_by_type.values())) * 100
+        print(f"  {component}: {gflops:.4f} GFLOPs ({percentage:.1f}%)")
+
+    if total_params > 0:
+        print(f"\nParameter efficiency:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Non-zero parameters: {non_zero_params:,}")
+        print(f"  Overall sparsity: {100 * (1 - non_zero_params / total_params):.2f}%")
+
+    print(f"\nTotal estimated GFLOPs: {total_gflops:.4f}")
+
+    return total_gflops
+
 class WhisperMemoryTracker:
     def __init__(self, model_name: str, save_path: str):
         self.model_name = model_name
@@ -643,6 +720,42 @@ def create_plots(results, metric_names, plot_dir):
     plt.close()
     print(f"Saved plot to {plot_path}")
 
+    # Create GFLOPs plot
+    plt.figure(figsize=(10, 6))
+
+    # Extract GFLOPs data
+    gflops_data = []
+
+    for percent in pruning_percentages:
+        # Find the model result with this percentage (prefer clean split)
+        model_name = f"random_{percent}_clean" if percent > 0 else "baseline_clean"
+        if model_name not in results and percent > 0:
+            model_name = f"random_{percent}_other"
+        if model_name not in results and percent == 0:
+            model_name = "baseline_other"
+
+        if model_name in results and "gflops" in results[model_name]:
+            gflops_data.append((percent, results[model_name]["gflops"]))
+
+    # Sort by pruning percentage
+    gflops_data.sort(key=lambda x: x[0])
+
+    # Plot GFLOPs
+    if gflops_data:
+        plt.plot([p for p, _ in gflops_data], [g for _, g in gflops_data], marker='o', label="GFLOPs")
+
+    plt.xlabel("Pruning Percentage (%)")
+    plt.ylabel("GFLOPs")
+    plt.title("Computational Complexity (GFLOPs) vs Random Pruning Percentage")
+    plt.grid(True)
+    plt.legend()
+
+    # Save the plot
+    plot_path = os.path.join(plot_dir, "gflops_vs_pruning.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved plot to {plot_path}")
+
 def main():
     # Configuration to match the quantization code
     original_model_name = "openai/whisper-small"
@@ -712,6 +825,10 @@ def main():
             sparsity = calculate_sparsity(model)
             print(f"Actual model sparsity: {sparsity:.2f}%")
 
+            # Calculate model GFLOPs
+            gflops = calculate_model_gflops(model)
+            print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
+
             # Evaluate on both splits
             for split, dataset in [("clean", processed_test_data_clean),
                                   ("other", processed_test_data_other)]:
@@ -741,6 +858,7 @@ def main():
                         results[f"{model_name}_{split}"] = {
                             "metrics": scores,
                             "model_size_mb": model_size,
+                            "gflops": gflops,  # Add GFLOPs to results
                             "model_type": model_name,
                             "pruning_percentage": 0 if "baseline" in model_name else int(model_name.split("_")[1]),
                             "actual_sparsity": sparsity
@@ -798,7 +916,7 @@ def main():
     # Create plots
     create_plots(
         results=results,
-        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb"],
+        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb", "gflops"],
         plot_dir=PLOTS_DIR
     )
 
@@ -814,6 +932,7 @@ def main():
         print(f"  CER: {baseline['metrics']['CER']:.4f}")
         print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
         print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
+        print(f"  GFLOPs: {baseline['gflops']:.4f}")
 
     print("\nResults for different pruning percentages:")
     for percent in pruning_percentages:
@@ -829,6 +948,7 @@ def main():
             cer_change = "-"
             rtf_change = "-"
             size_change = "-"
+            gflops_change = "-"
 
             if "baseline_clean" in results:
                 baseline = results["baseline_clean"]
@@ -836,12 +956,14 @@ def main():
                 cer_change = f"{(result['metrics']['CER'] - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
                 rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
                 size_change = f"{(result['sparse_model_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
+                gflops_change = f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
 
             print(f"\n{percent}% pruning:")
             print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
             print(f"  CER: {result['metrics']['CER']:.4f} ({cer_change})")
             print(f"  RTF: {result['metrics']['RTF']:.4f} ({rtf_change})")
             print(f"  Sparse Model Size: {result['sparse_model_size_mb']:.2f} MB ({size_change})")
+            print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
             print(f"  Actual Sparsity: {result['actual_sparsity']:.2f}%")
 
     print("\nPlots saved to:", PLOTS_DIR)

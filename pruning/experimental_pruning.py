@@ -29,6 +29,172 @@ for directory in [RESULTS_DIR, SELECTIVE_PRUNING_DIR, PLOTS_DIR, MODELS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 
+def calculate_model_gflops(model):
+    """
+    Calculate approximate GFLOPs for Whisper model accounting for pruning.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+
+    Returns:
+        float: Estimated GFLOPs
+    """
+    # Track FLOPs by module type
+    flops_by_type = {
+        "encoder": 0,
+        "decoder": 0,
+        "other": 0,
+        "attention": 0,  # For attention specific tracking
+        "feed_forward": 0,  # For feed-forward specific tracking
+        "early_layers": 0,  # For layer-specific tracking
+        "mid_layers": 0,
+        "late_layers": 0,
+    }
+
+    total_params = 0
+    non_zero_params = 0
+
+    # Analyze linear layers (where most computation happens)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            if not hasattr(module, "weight"):
+                continue
+
+            # Get layer dimensions
+            in_features = module.in_features
+            out_features = module.out_features
+
+            # Calculate theoretical FLOPs for this layer (multiply-add operations)
+            # Each output element requires in_features multiplications and in_features-1 additions
+            weight = module.weight
+
+            # Calculate sparsity and non-zero operations
+            weight_sparsity = (
+                torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
+            )
+            non_zero_ops = 2 * in_features * out_features * (1 - weight_sparsity)
+
+            # Categorize by location in model
+            if "encoder" in name:
+                flops_by_type["encoder"] += non_zero_ops
+
+                # Check if attention or feed-forward
+                if any(
+                    att_part in name
+                    for att_part in ["attention", "attn", "k_proj", "q_proj", "v_proj", "o_proj"]
+                ):
+                    flops_by_type["attention"] += non_zero_ops
+                elif any(ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]):
+                    flops_by_type["feed_forward"] += non_zero_ops
+
+                # Track layer depth
+                if "layers." in name:
+                    try:
+                        layer_str = name.split("layers.")[1].split(".")[0]
+                        layer_num = int(layer_str)
+                        if layer_num < 3:
+                            flops_by_type["early_layers"] += non_zero_ops
+                        elif layer_num < 6:
+                            flops_by_type["mid_layers"] += non_zero_ops
+                        else:
+                            flops_by_type["late_layers"] += non_zero_ops
+                    except (ValueError, IndexError):
+                        pass
+
+            elif "decoder" in name:
+                flops_by_type["decoder"] += non_zero_ops
+
+                # Check if attention or feed-forward
+                if any(
+                    att_part in name
+                    for att_part in ["attention", "attn", "k_proj", "q_proj", "v_proj", "o_proj"]
+                ):
+                    flops_by_type["attention"] += non_zero_ops
+                elif any(ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]):
+                    flops_by_type["feed_forward"] += non_zero_ops
+
+                # Track layer depth
+                if "layers." in name:
+                    try:
+                        layer_str = name.split("layers.")[1].split(".")[0]
+                        layer_num = int(layer_str)
+                        if layer_num < 3:
+                            flops_by_type["early_layers"] += non_zero_ops
+                        elif layer_num < 6:
+                            flops_by_type["mid_layers"] += non_zero_ops
+                        else:
+                            flops_by_type["late_layers"] += non_zero_ops
+                    except (ValueError, IndexError):
+                        pass
+            else:
+                flops_by_type["other"] += non_zero_ops
+
+            # Track parameter stats
+            total_params += weight.numel()
+            non_zero_params += (weight != 0).sum().item()
+
+    # For a typical forward pass and generation in Whisper:
+    # 1. Encoder processes the input once
+    # 2. Decoder runs multiple times (typically sequence length)
+    # Simplified assumption: avg sequence length of 25 tokens
+    avg_sequence_length = 25
+    total_flops = (
+        flops_by_type["encoder"]
+        + avg_sequence_length * flops_by_type["decoder"]
+        + flops_by_type["other"]
+    )
+
+    # Convert to GFLOPs
+    total_gflops = total_flops / 1e9
+
+    # Print detailed breakdown
+    print("\nEstimated GFLOPs by component:")
+    for component in ["encoder", "decoder", "other"]:
+        gflops = flops_by_type[component] / 1e9
+        percentage = (
+            flops_by_type[component]
+            / (flops_by_type["encoder"] + flops_by_type["decoder"] + flops_by_type["other"])
+        ) * 100
+        print(f"  {component}: {gflops:.4f} GFLOPs ({percentage:.1f}%)")
+
+    print("\nEstimated GFLOPs by neural network component:")
+    attention_gflops = flops_by_type["attention"] / 1e9
+    feedforward_gflops = flops_by_type["feed_forward"] / 1e9
+    att_ff_total = flops_by_type["attention"] + flops_by_type["feed_forward"]
+    if att_ff_total > 0:
+        print(
+            f"  attention: {attention_gflops:.4f} GFLOPs ({100 * flops_by_type['attention'] / att_ff_total:.1f}%)"
+        )
+        print(
+            f"  feed_forward: {feedforward_gflops:.4f} GFLOPs ({100 * flops_by_type['feed_forward'] / att_ff_total:.1f}%)"
+        )
+
+    print("\nEstimated GFLOPs by layer depth:")
+    layer_total = (
+        flops_by_type["early_layers"] + flops_by_type["mid_layers"] + flops_by_type["late_layers"]
+    )
+    if layer_total > 0:
+        print(
+            f"  early_layers: {flops_by_type['early_layers']/1e9:.4f} GFLOPs ({100 * flops_by_type['early_layers'] / layer_total:.1f}%)"
+        )
+        print(
+            f"  mid_layers: {flops_by_type['mid_layers']/1e9:.4f} GFLOPs ({100 * flops_by_type['mid_layers'] / layer_total:.1f}%)"
+        )
+        print(
+            f"  late_layers: {flops_by_type['late_layers']/1e9:.4f} GFLOPs ({100 * flops_by_type['late_layers'] / layer_total:.1f}%)"
+        )
+
+    if total_params > 0:
+        print("\nParameter efficiency:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Non-zero parameters: {non_zero_params:,}")
+        print(f"  Overall sparsity: {100 * (1 - non_zero_params / total_params):.2f}%")
+
+    print(f"\nTotal estimated GFLOPs: {total_gflops:.4f}")
+
+    return total_gflops
+
+
 class WhisperMemoryTracker:
     def __init__(self, model_name: str, save_path: str):
         self.model_name = model_name
@@ -380,6 +546,271 @@ def apply_selective_pruning(
     return model
 
 
+def apply_attention_head_pruning(model, amount=0.5):
+    """
+    Prune entire attention heads based on their L1 norm.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+        amount: Amount of heads to prune (0.5 = 50%)
+
+    Returns:
+        Pruned model
+    """
+    # Identify attention head projection layers
+    head_layers = []
+
+    # Track number of heads in each attention module
+    attention_modules = {}
+
+    for name, module in model.named_modules():
+        # Look for attention projection layers
+        if any(suffix in name for suffix in ["q_proj", "k_proj", "v_proj"]):
+            if hasattr(module, "weight"):
+                # Extract attention module name
+                if "encoder" in name:
+                    parts = name.split("encoder")[1].split(".")
+                    att_module = "encoder" + ".".join(parts[:-1])
+                    if att_module not in attention_modules:
+                        # Try to determine number of heads
+                        if hasattr(model.encoder, "layers"):
+                            layer_idx = int(parts[1])
+                            if hasattr(model.encoder.layers[layer_idx].self_attn, "num_heads"):
+                                attention_modules[att_module] = model.encoder.layers[
+                                    layer_idx
+                                ].self_attn.num_heads
+                            else:
+                                attention_modules[att_module] = 8  # Default for Whisper small
+                elif "decoder" in name:
+                    parts = name.split("decoder")[1].split(".")
+                    att_module = "decoder" + ".".join(parts[:-1])
+                    if att_module not in attention_modules:
+                        # Try to determine number of heads
+                        if hasattr(model.decoder, "layers"):
+                            layer_idx = int(parts[1])
+                            if hasattr(model.decoder.layers[layer_idx].self_attn, "num_heads"):
+                                attention_modules[att_module] = model.decoder.layers[
+                                    layer_idx
+                                ].self_attn.num_heads
+                            else:
+                                attention_modules[att_module] = 8  # Default for Whisper small
+
+                head_layers.append((name, module))
+
+    print(
+        f"Found {len(head_layers)} attention projection layers in {len(attention_modules)} attention modules"
+    )
+
+    # For each attention module, calculate head importance and prune the least important heads
+    heads_pruned = 0
+    total_heads = 0
+
+    for att_module, num_heads in attention_modules.items():
+        print(f"Processing {att_module} with {num_heads} heads")
+        total_heads += num_heads
+
+        # Get all projection layers for this attention module
+        module_layers = [(name, mod) for name, mod in head_layers if att_module in name]
+
+        if len(module_layers) < 3:  # Should have q, k, v projections
+            print(f"  Missing projection layers for {att_module}, skipping")
+            continue
+
+        # Calculate head importance
+        head_importance = torch.zeros(num_heads).to(next(model.parameters()).device)
+
+        for name, module in module_layers:
+            weight = module.weight
+
+            # Reshape to get per-head weights
+            if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+                # Extract head dimension (assuming weight shape is [out_dim, in_dim] with out_dim = num_heads * head_dim)
+                out_features = weight.size(0)
+                head_dim = out_features // num_heads
+
+                # Reshape to [num_heads, head_dim, in_dim]
+                reshaped = weight.view(num_heads, head_dim, -1)
+
+                # Calculate L1 norm for each head
+                head_l1 = torch.sum(torch.abs(reshaped), dim=(1, 2))
+
+                # Add to importance scores
+                head_importance += head_l1
+
+        # Determine number of heads to prune
+        num_to_prune = int(num_heads * amount)
+        if num_to_prune <= 0:
+            print(f"  No heads to prune for {att_module}")
+            continue
+
+        # Get indices of least important heads
+        _, indices = torch.topk(head_importance, k=num_heads - num_to_prune, largest=True)
+        heads_to_keep = set(indices.cpu().numpy())
+
+        print(f"  Pruning {num_to_prune} heads out of {num_heads}")
+
+        # Prune heads by zeroing out their weights
+        for name, module in module_layers:
+            weight = module.weight
+            out_features = weight.size(0)
+            head_dim = out_features // num_heads
+
+            # Create pruning mask
+            mask = torch.ones_like(weight)
+
+            # Zero out weights for pruned heads
+            for h in range(num_heads):
+                if h not in heads_to_keep:
+                    # Calculate start and end indices for this head
+                    start_idx = h * head_dim
+                    end_idx = (h + 1) * head_dim
+                    mask[start_idx:end_idx, :] = 0
+
+            # Apply mask
+            with torch.no_grad():
+                module.weight.mul_(mask)
+
+        heads_pruned += num_to_prune
+
+    print(
+        f"Pruned {heads_pruned} attention heads out of {total_heads} total heads ({100.0 * heads_pruned / total_heads:.1f}%)"
+    )
+    return model
+
+
+def apply_layer_dropping(model, layers_to_drop):
+    """
+    Apply layer dropping to a model by zeroing out entire transformer layers.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+        layers_to_drop: Dictionary specifying which layers to drop, e.g.,
+                       {'encoder': [0, 2], 'decoder': [1, 3]}
+
+    Returns:
+        Model with dropped layers
+    """
+    print("Applying layer dropping...")
+
+    total_layers = 0
+    dropped_layers = 0
+
+    # Process encoder layers
+    if (
+        "encoder" in layers_to_drop
+        and hasattr(model, "encoder")
+        and hasattr(model.encoder, "layers")
+    ):
+        encoder_layers = len(model.encoder.layers)
+        total_layers += encoder_layers
+
+        encoder_to_drop = [i for i in layers_to_drop["encoder"] if i < encoder_layers]
+        dropped_layers += len(encoder_to_drop)
+
+        print(
+            f"Dropping {len(encoder_to_drop)} out of {encoder_layers} encoder layers: {encoder_to_drop}"
+        )
+
+        # Zero out weights in the layers to be dropped
+        for layer_idx in encoder_to_drop:
+            for name, param in model.encoder.layers[layer_idx].named_parameters():
+                param.data.zero_()
+
+    # Process decoder layers
+    if (
+        "decoder" in layers_to_drop
+        and hasattr(model, "decoder")
+        and hasattr(model.decoder, "layers")
+    ):
+        decoder_layers = len(model.decoder.layers)
+        total_layers += decoder_layers
+
+        decoder_to_drop = [i for i in layers_to_drop["decoder"] if i < decoder_layers]
+        dropped_layers += len(decoder_to_drop)
+
+        print(
+            f"Dropping {len(decoder_to_drop)} out of {decoder_layers} decoder layers: {decoder_to_drop}"
+        )
+
+        # Zero out weights in the layers to be dropped
+        for layer_idx in decoder_to_drop:
+            for name, param in model.decoder.layers[layer_idx].named_parameters():
+                param.data.zero_()
+
+    print(
+        f"Dropped {dropped_layers} out of {total_layers} total layers ({100.0 * dropped_layers / total_layers:.1f}%)"
+    )
+    return model
+
+
+def prune_attention_vs_feedforward(model, method, config):
+    """
+    Prune attention and feed-forward networks with different sparsity levels.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+        method: Pruning method ('l1_unstructured', 'random_unstructured', etc.)
+        config: Dictionary with keys 'attention_amount' and 'ffn_amount'
+
+    Returns:
+        Pruned model
+    """
+    attention_amount = config.get("attention_amount", 0.3)
+    ffn_amount = config.get("ffn_amount", 0.7)
+
+    print(f"Pruning attention components with amount={attention_amount}")
+    print(f"Pruning feed-forward components with amount={ffn_amount}")
+
+    # Identify attention and feed-forward modules
+    attention_params = []
+    ffn_params = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # Check if it's an attention module
+            if any(
+                att_part in name
+                for att_part in ["attention", "attn", "k_proj", "q_proj", "v_proj", "o_proj"]
+            ):
+                attention_params.append((module, "weight"))
+            # Check if it's a feed-forward module
+            elif any(ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]):
+                ffn_params.append((module, "weight"))
+
+    print(
+        f"Found {len(attention_params)} attention modules and {len(ffn_params)} feed-forward modules"
+    )
+
+    # Apply pruning separately to attention and feed-forward networks
+    if method == "l1_unstructured":
+        if attention_params:
+            prune.global_unstructured(
+                attention_params, pruning_method=prune.L1Unstructured, amount=attention_amount
+            )
+        if ffn_params:
+            prune.global_unstructured(
+                ffn_params, pruning_method=prune.L1Unstructured, amount=ffn_amount
+            )
+    elif method == "random_unstructured":
+        if attention_params:
+            prune.global_unstructured(
+                attention_params, pruning_method=prune.RandomUnstructured, amount=attention_amount
+            )
+        if ffn_params:
+            prune.global_unstructured(
+                ffn_params, pruning_method=prune.RandomUnstructured, amount=ffn_amount
+            )
+
+    # Make pruning permanent
+    for module, param_name in attention_params + ffn_params:
+        try:
+            prune.remove(module, param_name)
+        except Exception:
+            pass
+
+    return model
+
+
 def calculate_sparsity(model, submodule_filter=None):
     """
     Calculate the sparsity percentage in the model or specific submodules.
@@ -414,10 +845,65 @@ def calculate_component_sparsity(model):
     decoder_sparsity = calculate_sparsity(model, ["decoder"])
     overall_sparsity = calculate_sparsity(model)
 
+    # Additional metrics for attention vs. feed-forward
+    attention_sparsity = calculate_sparsity(
+        model, ["attention", "attn", "k_proj", "q_proj", "v_proj", "o_proj"]
+    )
+    ffn_sparsity = calculate_sparsity(model, ["feed_forward", "fc", "mlp"])
+
+    # Calculate early, mid, and late layer sparsity
+    early_layers_sparsity = 0
+    mid_layers_sparsity = 0
+    late_layers_sparsity = 0
+
+    # Helper function to extract layer index
+    def get_layer_index(name):
+        if "layers." in name:
+            try:
+                layer_str = name.split("layers.")[1].split(".")[0]
+                return int(layer_str)
+            except (ValueError, IndexError):
+                return -1
+        return -1
+
+    # Count parameters by layer depth
+    early_total = 0
+    early_zeros = 0
+    mid_total = 0
+    mid_zeros = 0
+    late_total = 0
+    late_zeros = 0
+
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            layer_idx = get_layer_index(name)
+            if layer_idx >= 0:
+                if layer_idx < 3:
+                    early_total += param.numel()
+                    early_zeros += torch.sum(param == 0).item()
+                elif layer_idx < 6:
+                    mid_total += param.numel()
+                    mid_zeros += torch.sum(param == 0).item()
+                else:
+                    late_total += param.numel()
+                    late_zeros += torch.sum(param == 0).item()
+
+    if early_total > 0:
+        early_layers_sparsity = 100.0 * early_zeros / early_total
+    if mid_total > 0:
+        mid_layers_sparsity = 100.0 * mid_zeros / mid_total
+    if late_total > 0:
+        late_layers_sparsity = 100.0 * late_zeros / late_total
+
     return {
         "encoder_sparsity": encoder_sparsity,
         "decoder_sparsity": decoder_sparsity,
         "overall_sparsity": overall_sparsity,
+        "attention_sparsity": attention_sparsity,
+        "ffn_sparsity": ffn_sparsity,
+        "early_layers_sparsity": early_layers_sparsity,
+        "mid_layers_sparsity": mid_layers_sparsity,
+        "late_layers_sparsity": late_layers_sparsity,
     }
 
 
@@ -442,23 +928,47 @@ def load_whisper_model(model_name, device, pruning_config=None):
             print(f"Applying pruning with config: {pruning_config}")
 
             method = pruning_config.get("method", "l1_unstructured")
-            amount = pruning_config.get("amount", 0.5)
-            target_submodules = pruning_config.get("target_submodules", None)
-            make_permanent = pruning_config.get("make_permanent", True)
 
-            model = apply_selective_pruning(
-                model,
-                method=method,
-                amount=amount,
-                target_submodules=target_submodules,
-                make_permanent=make_permanent,
-            )
+            # Handle special pruning methods
+            if method == "attention_head_pruning":
+                amount = pruning_config.get("amount", 0.5)
+                model = apply_attention_head_pruning(model, amount=amount)
+            elif method == "layer_dropping":
+                layers_to_drop = pruning_config.get(
+                    "layers_to_drop", {"encoder": [], "decoder": []}
+                )
+                model = apply_layer_dropping(model, layers_to_drop)
+            elif method == "attention_vs_ffn":
+                config = {
+                    "attention_amount": pruning_config.get("attention_amount", 0.3),
+                    "ffn_amount": pruning_config.get("ffn_amount", 0.7),
+                }
+                pruning_method = pruning_config.get("pruning_method", "l1_unstructured")
+                model = prune_attention_vs_feedforward(model, pruning_method, config)
+            else:
+                # Standard selective pruning
+                amount = pruning_config.get("amount", 0.5)
+                target_submodules = pruning_config.get("target_submodules", None)
+                make_permanent = pruning_config.get("make_permanent", True)
+
+                model = apply_selective_pruning(
+                    model,
+                    method=method,
+                    amount=amount,
+                    target_submodules=target_submodules,
+                    make_permanent=make_permanent,
+                )
 
             # Calculate and print sparsity by component
             sparsity_info = calculate_component_sparsity(model)
             print("Sparsity by component:")
             print(f"  - Encoder: {sparsity_info['encoder_sparsity']:.2f}%")
             print(f"  - Decoder: {sparsity_info['decoder_sparsity']:.2f}%")
+            print(f"  - Attention: {sparsity_info['attention_sparsity']:.2f}%")
+            print(f"  - Feed-Forward: {sparsity_info['ffn_sparsity']:.2f}%")
+            print(f"  - Early layers: {sparsity_info['early_layers_sparsity']:.2f}%")
+            print(f"  - Mid layers: {sparsity_info['mid_layers_sparsity']:.2f}%")
+            print(f"  - Late layers: {sparsity_info['late_layers_sparsity']:.2f}%")
             print(f"  - Overall: {sparsity_info['overall_sparsity']:.2f}%")
 
         # Move model to device
@@ -676,6 +1186,95 @@ def compare_component_sizes(results):
     print(f"Saved component comparison plot to {plot_path}")
 
 
+def compare_attention_ffn_sparsity(results):
+    """Create a bar chart comparing sparsity in attention vs feed-forward components."""
+    plt.figure(figsize=(12, 8))
+
+    # Extract data
+    configs = []
+    attention_sparsities = []
+    ffn_sparsities = []
+
+    for model_name, result in results.items():
+        if "clean" in model_name and "attention_sparsity" in result:
+            # Get config name without split
+            config = model_name.replace("_clean", "")
+
+            configs.append(config)
+            attention_sparsities.append(result["attention_sparsity"])
+            ffn_sparsities.append(result["ffn_sparsity"])
+
+    if not configs:
+        print("No attention/ffn sparsity data available for plotting")
+        return
+
+    # Create grouped bar chart
+    x = np.arange(len(configs))
+    width = 0.35
+
+    plt.bar(x - width / 2, attention_sparsities, width, label="Attention Sparsity")
+    plt.bar(x + width / 2, ffn_sparsities, width, label="Feed-Forward Sparsity")
+
+    plt.xlabel("Pruning Configuration")
+    plt.ylabel("Sparsity (%)")
+    plt.title("Attention vs Feed-Forward Sparsity by Pruning Configuration")
+    plt.xticks(x, configs, rotation=45, ha="right")
+    plt.legend()
+    plt.tight_layout()
+
+    # Save the plot
+    plot_path = os.path.join(PLOTS_DIR, "attention_vs_ffn_sparsity.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved attention vs feed-forward comparison plot to {plot_path}")
+
+
+def compare_layer_depth_sparsity(results):
+    """Create a bar chart comparing sparsity across layer depths."""
+    plt.figure(figsize=(12, 8))
+
+    # Extract data
+    configs = []
+    early_sparsities = []
+    mid_sparsities = []
+    late_sparsities = []
+
+    for model_name, result in results.items():
+        if "clean" in model_name and "early_layers_sparsity" in result:
+            # Get config name without split
+            config = model_name.replace("_clean", "")
+
+            configs.append(config)
+            early_sparsities.append(result["early_layers_sparsity"])
+            mid_sparsities.append(result["mid_layers_sparsity"])
+            late_sparsities.append(result["late_layers_sparsity"])
+
+    if not configs:
+        print("No layer depth sparsity data available for plotting")
+        return
+
+    # Create grouped bar chart
+    x = np.arange(len(configs))
+    width = 0.25
+
+    plt.bar(x - width, early_sparsities, width, label="Early Layers (0-2)")
+    plt.bar(x, mid_sparsities, width, label="Middle Layers (3-5)")
+    plt.bar(x + width, late_sparsities, width, label="Late Layers (6+)")
+
+    plt.xlabel("Pruning Configuration")
+    plt.ylabel("Sparsity (%)")
+    plt.title("Sparsity by Layer Depth")
+    plt.xticks(x, configs, rotation=45, ha="right")
+    plt.legend()
+    plt.tight_layout()
+
+    # Save the plot
+    plot_path = os.path.join(PLOTS_DIR, "layer_depth_sparsity.png")
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved layer depth comparison plot to {plot_path}")
+
+
 def create_plots(results, metric_names, plot_dir):
     """
     Create plots of metrics for different pruning configurations.
@@ -781,10 +1380,53 @@ def create_plots(results, metric_names, plot_dir):
     plt.close()
     print(f"Saved plot to {plot_path}")
 
-    # Create encoder vs decoder sparsity comparison if data available
+    # Create GFLOPs plot
+    plt.figure(figsize=(10, 6))
+
+    # Extract GFLOPs values by configuration
+    gflops_data = {}
+
+    for model_name, model_results in results.items():
+        if "clean" in model_name:  # Just use clean split for GFLOPs
+            config = model_name.replace("_clean", "")
+            if "gflops" in model_results:
+                gflops_data[config] = model_results["gflops"]
+
+    if gflops_data:
+        # Sort configs by name
+        configs = sorted(gflops_data.keys())
+        gflops_values = [gflops_data[c] for c in configs]
+
+        # Plot GFLOPs
+        plt.bar(configs, gflops_values)
+
+        plt.xlabel("Pruning Configuration")
+        plt.ylabel("GFLOPs")
+        plt.title("Computational Complexity (GFLOPs) by Configuration")
+        plt.grid(True, axis="y")
+        plt.xticks(rotation=45, ha="right")  # Rotate labels for better readability
+        plt.tight_layout()
+
+        # Save the plot
+        plot_path = os.path.join(plot_dir, "gflops_by_config.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"Saved GFLOPs plot to {plot_path}")
+
+    # Create component comparison plots
     any_has_components = any("encoder_sparsity" in result for result in results.values())
     if any_has_components:
         compare_component_sizes(results)
+
+    # Create attention vs ffn comparison if data available
+    any_has_att_ffn = any("attention_sparsity" in result for result in results.values())
+    if any_has_att_ffn:
+        compare_attention_ffn_sparsity(results)
+
+    # Create layer depth comparison if data available
+    any_has_layer_depth = any("early_layers_sparsity" in result for result in results.values())
+    if any_has_layer_depth:
+        compare_layer_depth_sparsity(results)
 
 
 def main():
@@ -849,6 +1491,47 @@ def main():
                 "make_permanent": True,
             }
         },
+        # NEW: Early vs Late Layer Pruning
+        "early_layers_70": {
+            "pruning_config": {
+                "method": "custom",  # Will handle specially
+                "make_permanent": True,
+                "description": "70% pruning on early layers (0-2)",
+            }
+        },
+        "late_layers_70": {
+            "pruning_config": {
+                "method": "custom",  # Will handle specially
+                "make_permanent": True,
+                "description": "70% pruning on late layers (6+)",
+            }
+        },
+        # NEW: Attention vs Feed-Forward pruning
+        "attention_vs_ffn": {
+            "pruning_config": {
+                "method": "attention_vs_ffn",
+                "attention_amount": 0.3,  # Less pruning for attention
+                "ffn_amount": 0.7,  # More pruning for feed-forward
+                "pruning_method": "l1_unstructured",
+            }
+        },
+        # NEW: Attention Head Pruning
+        "head_pruning_50": {
+            "pruning_config": {
+                "method": "attention_head_pruning",
+                "amount": 0.5,  # Prune 50% of attention heads
+            }
+        },
+        # NEW: Layer Dropping
+        "layer_dropping": {
+            "pruning_config": {
+                "method": "layer_dropping",
+                "layers_to_drop": {
+                    "encoder": [0, 2, 4],  # Drop encoder layers 0, 2, 4
+                    "decoder": [1, 3, 5],  # Drop decoder layers 1, 3, 5
+                },
+            }
+        },
         # Layer-wise variable pruning (less aggressive in early layers)
         "layerwise_variable": {
             "pruning_config": {
@@ -897,8 +1580,79 @@ def main():
         clear_gpu_memory()
 
         try:
-            # Handle custom pruning methods
-            if model_name == "layerwise_variable":
+            if model_name == "early_layers_70":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Apply pruning specifically to early layers
+                print("Applying 70% pruning to early layers (0-2)...")
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        # Check if it's an early layer
+                        layer_idx = -1
+                        if "layers." in name:
+                            try:
+                                layer_str = name.split("layers.")[1].split(".")[0]
+                                layer_idx = int(layer_str)
+                            except (ValueError, IndexError):
+                                pass
+
+                        if layer_idx >= 0 and layer_idx < 3:
+                            # Apply heavy pruning to early layers
+                            prune.l1_unstructured(module, "weight", amount=0.7)
+                            print(f"  Pruned early layer: {name}")
+
+                # Make pruning permanent
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        try:
+                            prune.remove(module, "weight")
+                        except:
+                            pass
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "late_layers_70":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Apply pruning specifically to late layers
+                print("Applying 70% pruning to late layers (6+)...")
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        # Check if it's a late layer
+                        layer_idx = -1
+                        if "layers." in name:
+                            try:
+                                layer_str = name.split("layers.")[1].split(".")[0]
+                                layer_idx = int(layer_str)
+                            except (ValueError, IndexError):
+                                pass
+
+                        if layer_idx >= 6:
+                            # Apply heavy pruning to late layers
+                            prune.l1_unstructured(module, "weight", amount=0.7)
+                            print(f"  Pruned late layer: {name}")
+
+                # Make pruning permanent
+                for name, module in model.named_modules():
+                    if isinstance(module, torch.nn.Linear):
+                        try:
+                            prune.remove(module, "weight")
+                        except:
+                            pass
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "layerwise_variable":
                 # Load model
                 model = WhisperForConditionalGeneration.from_pretrained(
                     original_model_name, device_map=None
@@ -1024,7 +1778,16 @@ def main():
             print("Sparsity by component:")
             print(f"  - Encoder: {sparsity_info['encoder_sparsity']:.2f}%")
             print(f"  - Decoder: {sparsity_info['decoder_sparsity']:.2f}%")
+            print(f"  - Attention: {sparsity_info['attention_sparsity']:.2f}%")
+            print(f"  - Feed-Forward: {sparsity_info['ffn_sparsity']:.2f}%")
+            print(f"  - Early Layers: {sparsity_info['early_layers_sparsity']:.2f}%")
+            print(f"  - Mid Layers: {sparsity_info['mid_layers_sparsity']:.2f}%")
+            print(f"  - Late Layers: {sparsity_info['late_layers_sparsity']:.2f}%")
             print(f"  - Overall: {sparsity_info['overall_sparsity']:.2f}%")
+
+            # Calculate GFLOPs
+            gflops = calculate_model_gflops(model)
+            print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
 
             # Evaluate on both splits
             for split, dataset in [
@@ -1058,8 +1821,14 @@ def main():
                             "metrics": scores,
                             "model_size_mb": model_size,
                             "model_type": model_name,
+                            "gflops": gflops,  # Add GFLOPs to results
                             "encoder_sparsity": sparsity_info["encoder_sparsity"],
                             "decoder_sparsity": sparsity_info["decoder_sparsity"],
+                            "attention_sparsity": sparsity_info["attention_sparsity"],
+                            "ffn_sparsity": sparsity_info["ffn_sparsity"],
+                            "early_layers_sparsity": sparsity_info["early_layers_sparsity"],
+                            "mid_layers_sparsity": sparsity_info["mid_layers_sparsity"],
+                            "late_layers_sparsity": sparsity_info["late_layers_sparsity"],
                             "overall_sparsity": sparsity_info["overall_sparsity"],
                         }
 
@@ -1121,7 +1890,7 @@ def main():
     # Create plots
     create_plots(
         results=results,
-        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb"],
+        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb", "gflops"],
         plot_dir=PLOTS_DIR,
     )
 
@@ -1137,11 +1906,15 @@ def main():
         print(f"  CER: {baseline['metrics']['CER']:.4f}")
         print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
         print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
+        print(f"  GFLOPs: {baseline['gflops']:.4f}")
 
     # Group results by pruning approach
     config_groups = {
         "Encoder-only pruning": ["encoder_only_30", "encoder_only_50", "encoder_only_70"],
         "Decoder-only pruning": ["decoder_only_30", "decoder_only_50", "decoder_only_70"],
+        "Early vs Late layers pruning": ["early_layers_70", "late_layers_70"],
+        "Attention vs Feed-Forward pruning": ["attention_vs_ffn"],
+        "Structured pruning approaches": ["head_pruning_50", "layer_dropping"],
         "Advanced pruning approaches": ["layerwise_variable", "magnitude_threshold"],
     }
 
@@ -1157,12 +1930,14 @@ def main():
                 cer_change = "-"
                 rtf_change = "-"
                 size_change = "-"
+                gflops_change = "-"
 
                 if "baseline_clean" in results:
                     baseline = results["baseline_clean"]
                     wer_change = f"{(result['metrics']['WER'] - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
                     cer_change = f"{(result['metrics']['CER'] - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
                     rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
+                    gflops_change = f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
                     if "sparse_model_size_mb" in result:
                         size_change = f"{(result['sparse_model_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
 
@@ -1170,12 +1945,15 @@ def main():
                 print(f"    WER: {result['metrics']['WER']:.4f} ({wer_change})")
                 print(f"    CER: {result['metrics']['CER']:.4f} ({cer_change})")
                 print(f"    RTF: {result['metrics']['RTF']:.4f} ({rtf_change})")
+                print(f"    GFLOPs: {result['gflops']:.4f} ({gflops_change})")
                 if "sparse_model_size_mb" in result:
                     print(
                         f"    Sparse Model Size: {result['sparse_model_size_mb']:.2f} MB ({size_change})"
                     )
                 print(f"    Encoder Sparsity: {result['encoder_sparsity']:.2f}%")
                 print(f"    Decoder Sparsity: {result['decoder_sparsity']:.2f}%")
+                print(f"    Attention Sparsity: {result['attention_sparsity']:.2f}%")
+                print(f"    Feed-Forward Sparsity: {result['ffn_sparsity']:.2f}%")
                 print(f"    Overall Sparsity: {result['overall_sparsity']:.2f}%")
 
     print("\nPlots saved to:", PLOTS_DIR)

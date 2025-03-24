@@ -21,11 +21,11 @@ sns.set(style="whitegrid")
 
 # Create results directory
 RESULTS_DIR = "whisper_pruning_results"
-L1_PRUNING_DIR = os.path.join(RESULTS_DIR, "l1_pruning")
-PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
-MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
+RANDOM_PRUNING_DIR = os.path.join(RESULTS_DIR, "random_pruning")
+PLOTS_DIR = os.path.join(RANDOM_PRUNING_DIR, "plots")
+MODELS_DIR = os.path.join(RANDOM_PRUNING_DIR, "models")
 
-for directory in [RESULTS_DIR, L1_PRUNING_DIR, PLOTS_DIR, MODELS_DIR]:
+for directory in [RESULTS_DIR, RANDOM_PRUNING_DIR, PLOTS_DIR, MODELS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 
@@ -98,24 +98,30 @@ def calculate_pruned_dense_size(model, pruning_threshold=0.0):
     return dense_pruned_size_mb
 
 
-def calculate_model_gflops(model):
+def calculate_model_gflops(model, detailed=True):
     """
-    Calculate approximate GFLOPs for Whisper model accounting for pruning.
+    Calculate more accurate GFLOPs for Whisper model accounting for pruning.
 
     Args:
         model: The WhisperForConditionalGeneration model
+        detailed: Whether to print detailed breakdown
 
     Returns:
         float: Estimated GFLOPs
     """
-    # Track FLOPs by module type
-    flops_by_type = {"encoder": 0, "decoder": 0, "other": 0}
+    # Track FLOPs by component and operation type
+    flops_breakdown = {
+        "encoder": {"linear": 0, "attention": 0, "other": 0},
+        "decoder": {"linear": 0, "attention": 0, "other": 0},
+        "other": {"linear": 0, "other": 0},
+    }
 
     total_params = 0
     non_zero_params = 0
 
-    # Analyze linear layers (where most computation happens)
+    # Analyze model structure
     for name, module in model.named_modules():
+        # Linear layer analysis (bulk of computations)
         if isinstance(module, torch.nn.Linear):
             if not hasattr(module, "weight"):
                 continue
@@ -123,57 +129,111 @@ def calculate_model_gflops(model):
             # Get layer dimensions
             in_features = module.in_features
             out_features = module.out_features
+            batch_size = 1  # Default assumption for inference
 
-            # Calculate theoretical FLOPs for this layer (multiply-add operations)
-            # Each output element requires in_features multiplications and in_features-1 additions
+            # Calculate sparsity
             weight = module.weight
-
-            # Calculate sparsity and non-zero operations
             weight_sparsity = (
                 torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
             )
-            non_zero_ops = 2 * in_features * out_features * (1 - weight_sparsity)
 
-            # Categorize by location in model
+            # For encoder, assume sequence length is ~3000 frames for 30 seconds audio
+            # For decoder, assume output length of ~25 tokens
             if "encoder" in name:
-                flops_by_type["encoder"] += non_zero_ops
+                seq_length = 3000  # Typical for 30s audio
+                # Add forward pass FLOPs: non-zero multiply-adds
+                layer_flops = (
+                    2 * batch_size * seq_length * in_features * out_features * (1 - weight_sparsity)
+                )
+                flops_breakdown["encoder"]["linear"] += layer_flops
             elif "decoder" in name:
-                flops_by_type["decoder"] += non_zero_ops
+                seq_length = 25  # Typical token length
+                # For decoder, account for multiple forward passes during generation
+                layer_flops = (
+                    2 * batch_size * seq_length * in_features * out_features * (1 - weight_sparsity)
+                )
+                flops_breakdown["decoder"]["linear"] += layer_flops
             else:
-                flops_by_type["other"] += non_zero_ops
+                # Other linear layers
+                seq_length = 1
+                layer_flops = (
+                    2 * batch_size * seq_length * in_features * out_features * (1 - weight_sparsity)
+                )
+                flops_breakdown["other"]["linear"] += layer_flops
 
             # Track parameter stats
             total_params += weight.numel()
             non_zero_params += (weight != 0).sum().item()
 
-    # For a typical forward pass and generation in Whisper:
-    # 1. Encoder processes the input once
-    # 2. Decoder runs multiple times (typically sequence length)
-    # Simplified assumption: avg sequence length of 25 tokens
-    avg_sequence_length = 25
-    total_flops = (
-        flops_by_type["encoder"]
-        + avg_sequence_length * flops_by_type["decoder"]
-        + flops_by_type["other"]
-    )
+        # Attention mechanism (additional complexity)
+        elif "attention" in name.lower() and hasattr(module, "forward"):
+            # Estimate attention FLOPs: query @ key operations + softmax + weighted sum
+            if "encoder" in name:
+                seq_length = 3000
+                head_dim = 64  # Typical for Whisper
+                num_heads = 8  # Typical for Whisper small
+
+                # Q@K^T operation: batch * heads * seq_len * seq_len * head_dim
+                qk_flops = 2 * batch_size * num_heads * seq_length * seq_length * head_dim
+
+                # Softmax: 5 flops per element (exp, sum, div)
+                softmax_flops = 5 * batch_size * num_heads * seq_length * seq_length
+
+                # Weighted sum: batch * heads * seq_len * seq_len * head_dim
+                weighted_sum_flops = 2 * batch_size * num_heads * seq_length * seq_length * head_dim
+
+                # Total attention FLOPs
+                attn_flops = qk_flops + softmax_flops + weighted_sum_flops
+                flops_breakdown["encoder"]["attention"] += attn_flops
+            elif "decoder" in name:
+                seq_length = 25
+                head_dim = 64
+                num_heads = 8
+
+                # Similar calculations for decoder
+                qk_flops = 2 * batch_size * num_heads * seq_length * seq_length * head_dim
+                softmax_flops = 5 * batch_size * num_heads * seq_length * seq_length
+                weighted_sum_flops = 2 * batch_size * num_heads * seq_length * seq_length * head_dim
+
+                attn_flops = qk_flops + softmax_flops + weighted_sum_flops
+                flops_breakdown["decoder"]["attention"] += attn_flops
+
+    # Estimate other operations (activations, layer norms, etc.) as percentage of linear ops
+    other_percentage = 0.1  # Typically around 10% of linear ops
+    flops_breakdown["encoder"]["other"] = other_percentage * flops_breakdown["encoder"]["linear"]
+    flops_breakdown["decoder"]["other"] = other_percentage * flops_breakdown["decoder"]["linear"]
+    flops_breakdown["other"]["other"] = other_percentage * flops_breakdown["other"]["linear"]
+
+    # Sum up all FLOPs
+    total_flops = sum([sum(component.values()) for component in flops_breakdown.values()])
 
     # Convert to GFLOPs
     total_gflops = total_flops / 1e9
 
-    # Print detailed breakdown
-    print("\nEstimated GFLOPs by component:")
-    for component, flops in flops_by_type.items():
-        gflops = flops / 1e9
-        percentage = (flops / sum(flops_by_type.values())) * 100
-        print(f"  {component}: {gflops:.4f} GFLOPs ({percentage:.1f}%)")
+    if detailed:
+        # Print detailed breakdown
+        print("\nEstimated GFLOPs by component:")
+        for component, ops in flops_breakdown.items():
+            component_flops = sum(ops.values())
+            component_gflops = component_flops / 1e9
+            component_percentage = (component_flops / total_flops) * 100 if total_flops > 0 else 0
+            print(f"  {component}: {component_gflops:.4f} GFLOPs ({component_percentage:.1f}%)")
 
-    if total_params > 0:
-        print("\nParameter efficiency:")
-        print(f"  Total parameters: {total_params:,}")
-        print(f"  Non-zero parameters: {non_zero_params:,}")
-        print(f"  Overall sparsity: {100 * (1 - non_zero_params / total_params):.2f}%")
+            # Print breakdown by operation type
+            for op_type, op_flops in ops.items():
+                op_gflops = op_flops / 1e9
+                op_percentage = (op_flops / component_flops) * 100 if component_flops > 0 else 0
+                print(
+                    f"    {op_type}: {op_gflops:.4f} GFLOPs ({op_percentage:.1f}% of {component})"
+                )
 
-    print(f"\nTotal estimated GFLOPs: {total_gflops:.4f}")
+        if total_params > 0:
+            print("\nParameter efficiency:")
+            print(f"  Total parameters: {total_params:,}")
+            print(f"  Non-zero parameters: {non_zero_params:,}")
+            print(f"  Overall sparsity: {100 * (1 - non_zero_params / total_params):.2f}%")
+
+        print(f"\nTotal estimated GFLOPs: {total_gflops:.4f}")
 
     return total_gflops
 
@@ -184,7 +244,6 @@ class WhisperMemoryTracker:
         self.save_path = save_path
         self.peak_gpu_memory = 0
         self.peak_cpu_percent = 0
-        self.peak_ram_gb = 0
         self.memory_measurements = deque(maxlen=500)  # Store last 500 measurements
         self.start_time = time.time()
         self.process = psutil.Process()
@@ -199,16 +258,16 @@ class WhisperMemoryTracker:
             [self.process.cpu_percent(interval=0.1) for _ in range(5)]
         )  # Stable avg
         self.initial_ram_usage = self.process.memory_info().rss / (1024**3)
-        self.peak_ram_gb = self.initial_ram_usage
 
         # Initialize GPU memory metrics if available
         if torch.cuda.is_available():
             self.device_type = "cuda"
             self.initial_gpu_memory = torch.cuda.memory_allocated() / (1024**3)
             self.initial_gpu_cached = torch.cuda.memory_reserved() / (1024**3)
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        elif torch.backends.mps.is_available():
             self.device_type = "mps"
-            # MPS doesn't have easy memory tracking like CUDA
+            # MPS doesn't have easy memory tracking like CUDA,
+            # so we'll rely more on CPU/RAM metrics
 
     def log_memory(self, split, batch_idx, batch_size, audio_duration):
         current_time = time.time()
@@ -216,20 +275,20 @@ class WhisperMemoryTracker:
             [self.process.cpu_percent(interval=0.1) for _ in range(3)]
         )  # Avg over 3 readings
         current_ram = self.process.memory_info().rss / (1024**3)
-        self.peak_ram_gb = max(self.peak_ram_gb, current_ram)
 
         memory_data = {
-            "timestamp": float(current_time - self.start_time),  # Ensure it's a native float
-            "cpu_percent": float(cpu_percent),  # Ensure it's a native float
-            "ram_gb": float(current_ram),  # Ensure it's a native float
+            "timestamp": float(current_time - self.start_time),
+            "cpu_percent": float(cpu_percent),
+            "ram_gb": float(current_ram),
             "batch_info": {
                 "split": split,
-                "batch_idx": int(batch_idx),  # Ensure it's a native int
-                "batch_size": int(batch_size),  # Ensure it's a native int
-                "audio_duration": float(audio_duration),  # Ensure it's a native float
+                "batch_idx": int(batch_idx),
+                "batch_size": int(batch_size),
+                "audio_duration": float(audio_duration),
             },
         }
 
+        # For CUDA devices
         if torch.cuda.is_available():
             gpu_allocated = float(torch.cuda.memory_allocated() / (1024**3))
             gpu_cached = float(torch.cuda.memory_reserved() / (1024**3))
@@ -243,9 +302,10 @@ class WhisperMemoryTracker:
                 }
             )
             self.peak_gpu_memory = max(self.peak_gpu_memory, gpu_peak)
-        elif self.device_type == "mps":
-            # MPS does not have native memory tracking, but we'll include device info
-            memory_data.update({"device_type": "mps"})
+
+        # Track peak RAM
+        self.peak_ram_gb = getattr(self, "peak_ram_gb", 0)
+        self.peak_ram_gb = max(self.peak_ram_gb, current_ram)
 
         # Append the memory measurement and explicitly make it a dict
         self.memory_measurements.append(dict(memory_data))
@@ -270,9 +330,9 @@ class WhisperMemoryTracker:
                 "peak_percent": self.peak_cpu_percent,
                 "average_percent": avg_cpu_usage,
                 "initial_ram_gb": self.initial_ram_usage,
-                "peak_ram_gb": self.peak_ram_gb,
+                "peak_ram_gb": getattr(self, "peak_ram_gb", self.initial_ram_usage),
                 "average_ram_gb": avg_ram_usage,
-                "current_ram_gb": self.process.memory_info().rss / (1024**3),
+                "current_ram_gb": psutil.Process().memory_info().rss / (1024**3),
             },
         }
 
@@ -291,6 +351,8 @@ class WhisperMemoryTracker:
                     "current_allocated_gb": torch.cuda.memory_allocated() / (1024**3),
                     "current_cached_gb": torch.cuda.memory_reserved() / (1024**3),
                 }
+
+        # MPS doesn't have explicit memory tracking, but we still want to indicate device type
         elif self.device_type == "mps":
             summary["mps"] = {
                 "device_type": "mps",
@@ -358,12 +420,13 @@ class WhisperMemoryTracker:
         print(f"  Current RAM: {summary['cpu']['current_ram_gb']:.4f} GB")
 
         if "gpu" in summary:
-            print("\nGPU Usage:")
+            print("\nGPU Usage (CUDA):")
             print(f"  Initial Allocated: {summary['gpu']['initial_allocated_gb']:.4f} GB")
             print(f"  Peak Allocated: {summary['gpu']['peak_allocated_gb']:.4f} GB")
             print(f"  Average Allocated: {summary['gpu']['average_allocated_gb']:.4f} GB")
             print(f"  Current Allocated: {summary['gpu']['current_allocated_gb']:.4f} GB")
             print(f"  Current Cached: {summary['gpu']['current_cached_gb']:.4f} GB")
+
         elif "mps" in summary:
             print("\nGPU Usage (MPS):")
             print("  Note: Detailed MPS memory metrics not available")
@@ -445,42 +508,38 @@ def save_sparse_model(model, output_path):
             sparse_params += param.numel() * 4  # 4 bytes per float32
 
     # Save sparse model
-    try:
-        print(f"Saving sparse model to {output_path}")
-        torch.save(sparse_state_dict, output_path)
+    print(f"Saving sparse model to {output_path}")
+    torch.save(sparse_state_dict, output_path)
 
-        # Get actual saved size
-        actual_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        estimated_dense_mb = original_params / (1024 * 1024)
-        estimated_sparse_mb = sparse_params / (1024 * 1024)
+    # Get actual saved size
+    actual_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    estimated_dense_mb = original_params / (1024 * 1024)
+    estimated_sparse_mb = sparse_params / (1024 * 1024)
 
-        # Print sparsity by parameter type
-        print("\nSparsity by parameter type:")
-        for param_type, stats in sparsity_by_type.items():
-            sparsity_pct = 100.0 * stats["zeros"] / stats["total"] if stats["total"] > 0 else 0
-            print(
-                f"  {param_type}: {sparsity_pct:.1f}% sparse ({stats['zeros']}/{stats['total']} zeros)"
-            )
-
-        # Print size statistics
-        print("\nModel size summary:")
-        print(f"  Dense model size (theoretical): {estimated_dense_mb:.2f} MB")
-        print(f"  Sparse model size (theoretical): {estimated_sparse_mb:.2f} MB")
-        print(f"  Sparse model size (actual file): {actual_size_mb:.2f} MB")
-        print(f"  Compression ratio: {estimated_dense_mb/actual_size_mb:.2f}x")
+    # Print sparsity by parameter type
+    print("\nSparsity by parameter type:")
+    for param_type, stats in sparsity_by_type.items():
+        sparsity_pct = 100.0 * stats["zeros"] / stats["total"] if stats["total"] > 0 else 0
         print(
-            f"  Size reduction: {100.0 * (estimated_dense_mb - actual_size_mb) / estimated_dense_mb:.1f}%"
+            f"  {param_type}: {sparsity_pct:.1f}% sparse ({stats['zeros']}/{stats['total']} zeros)"
         )
 
-        return actual_size_mb
-    except Exception as e:
-        print(f"Error saving sparse model: {e}")
-        return 0
+    # Print size statistics
+    print("\nModel size summary:")
+    print(f"  Dense model size (theoretical): {estimated_dense_mb:.2f} MB")
+    print(f"  Sparse model size (theoretical): {estimated_sparse_mb:.2f} MB")
+    print(f"  Sparse model size (actual file): {actual_size_mb:.2f} MB")
+    print(f"  Compression ratio: {estimated_dense_mb/actual_size_mb:.2f}x")
+    print(
+        f"  Size reduction: {100.0 * (estimated_dense_mb - actual_size_mb) / estimated_dense_mb:.1f}%"
+    )
+
+    return actual_size_mb
 
 
-def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=False):
+def apply_random_pruning(model, amount=0.3, target_modules=None, make_permanent=False):
     """
-    Apply L1 unstructured pruning to a Whisper model.
+    Apply random pruning to a Whisper model.
 
     Args:
         model: The WhisperForConditionalGeneration model
@@ -506,12 +565,12 @@ def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=Fals
         print("Warning: No parameters found to prune! Check your target modules.")
         return model
 
-    print(
-        f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
-    )
+    print(f"Found {len(params_to_prune)} modules to prune with random pruning, amount={amount}")
 
-    # Apply L1 unstructured pruning
-    prune.global_unstructured(params_to_prune, pruning_method=prune.L1Unstructured, amount=amount)
+    # Apply random unstructured pruning
+    prune.global_unstructured(
+        params_to_prune, pruning_method=prune.RandomUnstructured, amount=amount
+    )
 
     # Make pruning permanent if requested
     if make_permanent:
@@ -568,7 +627,7 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
         torch_dtype = torch.float32
         if device.type == "cuda":
             torch_dtype = torch.float16  # Use half precision on CUDA
-        # MPS and CPU perform best with float32
+        # MPS performs best with float32 currently, so we keep the default
 
         print(f"Loading model with dtype: {torch_dtype}")
 
@@ -579,8 +638,10 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
 
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
-            print(f"Applying L1 unstructured pruning with amount={pruning_amount}")
-            model = apply_l1_pruning(model, amount=pruning_amount, make_permanent=make_permanent)
+            print(f"Applying random pruning with amount={pruning_amount}")
+            model = apply_random_pruning(
+                model, amount=pruning_amount, make_permanent=make_permanent
+            )
 
             # Calculate and print sparsity
             sparsity = calculate_sparsity(model)
@@ -612,7 +673,7 @@ def clear_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    elif torch.backends.mps.is_available():
         # MPS doesn't have explicit memory management functions like CUDA,
         # but we can still force garbage collection
         print("Clearing memory on MPS device")
@@ -622,16 +683,6 @@ def clear_gpu_memory():
 
     # Force garbage collection again after clearing cache
     gc.collect()
-
-
-def map_to_feats(batch, processor):
-    audio = batch["audio"]
-    input_features = processor(
-        audio["array"], sampling_rate=audio["sampling_rate"], return_tensors="pt"
-    ).input_features
-    batch["input_features"] = input_features
-    batch["reference"] = processor.tokenizer.normalize(batch["text"])
-    return batch
 
 
 def transcribe_batch(batch, model, processor, memory_tracker, split, batch_idx):
@@ -653,10 +704,10 @@ def transcribe_batch(batch, model, processor, memory_tracker, split, batch_idx):
         try:
             predicted_ids = model.generate(features)
 
-            # Synchronize based on device type
+            # Synchronize for both CUDA and MPS
             if torch.cuda.is_available():
                 torch.cuda.synchronize()  # Ensure all CUDA ops complete
-            elif hasattr(torch.mps, "synchronize") and model.device.type == "mps":
+            elif hasattr(torch.mps, "synchronize"):
                 torch.mps.synchronize()  # Ensure all MPS ops complete
 
             # Explicitly delete features tensor to free memory immediately
@@ -692,7 +743,7 @@ def transcribe_batch(batch, model, processor, memory_tracker, split, batch_idx):
     # Delete predicted_ids to free memory
     del predicted_ids
 
-    # Save per-sample RTF, processing time, and audio duration (same value repeated for all samples in the batch)
+    # Save per-sample RTF, processing time, and audio duration
     batch["rtf"] = [batch_rtf] * len(batch["audio"])
     batch["processing_time"] = [processing_time] * len(batch["audio"])
     batch["audio_duration"] = [total_audio_duration] * len(batch["audio"])
@@ -700,7 +751,9 @@ def transcribe_batch(batch, model, processor, memory_tracker, split, batch_idx):
     return batch
 
 
-def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, batch_size=16):
+def evaluate_model(
+    model, processor, dataset, metrics, memory_tracker, split, batch_size=1
+):  # Default to batch size 1
     total_processing_time = 0.0
     total_audio_duration = 0.0
     batch_counter = 0
@@ -721,42 +774,33 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
         nonlocal batch_counter, total_processing_time, total_audio_duration
 
         # Process the batch and update the cumulative totals
-        try:
-            result = transcribe_batch(batch, model, processor, memory_tracker, split, batch_counter)
+        result = transcribe_batch(batch, model, processor, memory_tracker, split, batch_counter)
 
-            # Each sample in the batch has the same processing time and audio duration;
-            # take the value from the first sample as representative.
-            batch_processing_time = result["processing_time"][0]
-            batch_audio_duration = result["audio_duration"][0]
-            batch_rtf = batch_processing_time / batch_audio_duration
+        # Each sample in the batch has the same processing time and audio duration;
+        # take the value from the first sample as representative.
+        batch_processing_time = result["processing_time"][0]
+        batch_audio_duration = result["audio_duration"][0]
+        batch_rtf = batch_processing_time / batch_audio_duration
 
-            # Store batch metrics
-            batch_rtfs.append(batch_rtf)
-            batch_times.append(batch_processing_time)
+        # Store batch metrics
+        batch_rtfs.append(batch_rtf)
+        batch_times.append(batch_processing_time)
 
-            print(
-                f"Batch {batch_counter}: processing time = {batch_processing_time:.2f}s, "
-                f"audio duration = {batch_audio_duration:.2f}s, "
-                f"RTF = {batch_rtf:.6f}"
-            )
+        print(
+            f"Batch {batch_counter}: processing time = {batch_processing_time:.2f}s, "
+            f"audio duration = {batch_audio_duration:.2f}s, "
+            f"RTF = {batch_rtf:.6f}"
+        )
 
-            total_processing_time += batch_processing_time
-            total_audio_duration += batch_audio_duration
-            batch_counter += 1
+        total_processing_time += batch_processing_time
+        total_audio_duration += batch_audio_duration
+        batch_counter += 1
 
-            # Force synchronization based on device type
-            if device_type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elif device_type == "mps" and hasattr(torch.mps, "synchronize"):
-                torch.mps.synchronize()
-        except Exception as e:
-            print(f"Error processing batch {batch_counter}: {e}")
-            # Return batch without predictions if there was an error
-            batch["prediction"] = [""] * len(batch["audio"])
-            batch["rtf"] = [0.0] * len(batch["audio"])
-            batch["processing_time"] = [0.0] * len(batch["audio"])
-            batch["audio_duration"] = [0.0] * len(batch["audio"])
-            return batch
+        # Force synchronization based on device type
+        if device_type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif device_type == "mps" and hasattr(torch.mps, "synchronize"):
+            torch.mps.synchronize()
 
         # Clear memory after each batch
         clear_gpu_memory()
@@ -764,21 +808,17 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
         return result
 
     start = time.time()
-    try:
-        result = dataset.map(process_batch, batched=True, batch_size=batch_size)
-    except Exception as e:
-        print(f"Error during dataset mapping: {e}")
-        return {"error": str(e)}, {"error": str(e)}
+    result = dataset.map(process_batch, batched=True, batch_size=batch_size)
     end = time.time()
 
     # Calculate overall RTF from the accumulated totals
-    overall_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
+    overall_rtf = total_processing_time / total_audio_duration
 
     # Calculate batch statistics
     avg_batch_rtf = sum(batch_rtfs) / len(batch_rtfs) if batch_rtfs else 0
     min_batch_rtf = min(batch_rtfs) if batch_rtfs else 0
     max_batch_rtf = max(batch_rtfs) if batch_rtfs else 0
-    std_batch_rtf = float(np.std(batch_rtfs)) if batch_rtfs else 0
+    std_batch_rtf = np.std(batch_rtfs) if batch_rtfs else 0
 
     print("\nRTF Statistics:")
     print(f"  Overall RTF: {overall_rtf:.6f}")
@@ -791,42 +831,35 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
     scores = {}
     for metric_name, metric in metrics.items():
         if metric_name in ["WER", "CER"]:
-            try:
-                score = 100 * metric.compute(
-                    references=result["reference"], predictions=result["prediction"]
-                )
-                scores[metric_name] = score
-                print(f"{metric_name}: {score:.5f}")
-            except Exception as e:
-                print(f"Error computing {metric_name}: {e}")
-                scores[metric_name] = -1.0
+            score = 100 * metric.compute(
+                references=result["reference"], predictions=result["prediction"]
+            )
+            scores[metric_name] = score
+            print(f"{metric_name}: {score:.5f}")
 
     # Store all metrics in scores dictionary
     scores["RTF"] = overall_rtf
     scores["avg_batch_rtf"] = avg_batch_rtf
     scores["min_batch_rtf"] = min_batch_rtf
     scores["max_batch_rtf"] = max_batch_rtf
-    scores["std_batch_rtf"] = std_batch_rtf
+    scores["std_batch_rtf"] = float(std_batch_rtf)  # Convert numpy float to native float
     scores["total_processing_time"] = total_processing_time
     scores["total_audio_duration"] = total_audio_duration
     scores["avg_latency"] = total_processing_time / batch_counter if batch_counter > 0 else 0
 
     # Record CPU metrics
-    try:
-        summary = memory_tracker.get_memory_summary()
-        scores["avg_cpu_percent"] = summary["cpu"]["average_percent"]
-        scores["peak_cpu_percent"] = summary["cpu"]["peak_percent"]
-        scores["initial_ram_gb"] = summary["cpu"]["initial_ram_gb"]
-        scores["peak_ram_gb"] = summary["cpu"]["peak_ram_gb"]
-        scores["avg_ram_gb"] = summary["cpu"]["average_ram_gb"]
-        scores["current_ram_gb"] = summary["cpu"]["current_ram_gb"]
+    summary = memory_tracker.get_memory_summary()
+    scores["avg_cpu_percent"] = summary["cpu"]["average_percent"]
+    scores["peak_cpu_percent"] = summary["cpu"]["peak_percent"]
+    scores["initial_ram_gb"] = summary["cpu"]["initial_ram_gb"]
+    scores["peak_ram_gb"] = summary["cpu"]["peak_ram_gb"]
+    scores["avg_ram_gb"] = summary["cpu"]["average_ram_gb"]
+    scores["current_ram_gb"] = summary["cpu"]["current_ram_gb"]
 
-        # Record GPU metrics if available
-        if "gpu" in summary:
-            scores["gpu_peak_allocated_gb"] = summary["gpu"]["peak_allocated_gb"]
-            scores["gpu_average_allocated_gb"] = summary["gpu"]["average_allocated_gb"]
-    except Exception as e:
-        print(f"Error recording memory metrics: {e}")
+    # Record GPU metrics if available
+    if "gpu" in summary:
+        scores["gpu_peak_allocated_gb"] = summary["gpu"]["peak_allocated_gb"]
+        scores["gpu_average_allocated_gb"] = summary["gpu"]["average_allocated_gb"]
 
     print(f"\n{len(result)} sentences evaluated in {end - start:.2f} s.")
     print(f"Average batch latency: {scores['avg_latency']:.4f} s")
@@ -840,45 +873,44 @@ def load_librispeech(num_samples=None, split="test.clean"):
     """
     Load LibriSpeech clean/other data.
     """
-    try:
-        if num_samples:
-            # Stream partial dataset
-            stream_dataset = datasets.load_dataset(
-                "librispeech_asr", split=split, streaming=True, trust_remote_code=True
-            )
-            dataset = datasets.Dataset.from_dict(
-                {
-                    k: [sample[k] for sample in list(stream_dataset.take(num_samples))]
-                    for k in next(iter(stream_dataset)).keys()
-                }
-            )
-        else:
-            # Load full dataset
-            dataset = datasets.load_dataset("librispeech_asr", split=split)
-
-        total_duration_seconds = sum(
-            len(sample["audio"]["array"]) / sample["audio"]["sampling_rate"] for sample in dataset
+    if num_samples:
+        # Stream partial dataset
+        stream_dataset = datasets.load_dataset(
+            "librispeech_asr", split=split, streaming=True, trust_remote_code=True
         )
-        total_hours = total_duration_seconds / 3600
+        dataset = datasets.Dataset.from_dict(
+            {
+                k: [sample[k] for sample in list(stream_dataset.take(num_samples))]
+                for k in next(iter(stream_dataset)).keys()
+            }
+        )
+    else:
+        # Load full dataset
+        dataset = datasets.load_dataset("librispeech_asr", split=split)
+    total_duration_seconds = sum(
+        len(sample["audio"]["array"]) / sample["audio"]["sampling_rate"] for sample in dataset
+    )
+    total_hours = total_duration_seconds / 3600
 
-        print(f"Loaded {len(dataset)} test samples")
-        print(f"Total audio duration: {total_hours:.4f} hours")
-        return dataset
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        raise
+    print(f"Loaded {len(dataset)} test samples")
+    print(f"Total audio duration: {total_hours:.4f} hours")
+    return dataset
 
 
 def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
-    try:
-        buffer = io.BytesIO()
-        torch.save(
-            model.state_dict(), buffer, _use_new_zipfile_serialization=True
-        )  # Use new serialization
-        return buffer.getbuffer().nbytes / (1024**2)
-    except Exception as e:
-        print(f"Error measuring model size: {e}")
-        return 0.0
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return buffer.getbuffer().nbytes / (1024**2)
+
+
+def map_to_feats(batch, processor):
+    audio = batch["audio"]
+    input_features = processor(
+        audio["array"], sampling_rate=audio["sampling_rate"], return_tensors="pt"
+    ).input_features
+    batch["input_features"] = input_features
+    batch["reference"] = processor.tokenizer.normalize(batch["text"])
+    return batch
 
 
 def create_plots(results, metric_names, plot_dir):
@@ -898,18 +930,18 @@ def create_plots(results, metric_names, plot_dir):
 
     # First, identify all unique pruning percentages
     for model_name, model_results in results.items():
-        try:
-            if "baseline" in model_name:
-                percent = 0
-            else:
-                # Extract percentage from model name (e.g., "l1_10")
+        if "baseline" in model_name:
+            percent = 0
+        else:
+            # Extract percentage from model name (e.g., "random_10")
+            try:
                 percent = int(model_name.split("_")[1])
+            except (IndexError, ValueError):
+                print(f"Warning: Could not extract pruning percentage from {model_name}")
+                continue
 
-            if percent not in pruning_percentages:
-                pruning_percentages.append(percent)
-        except (IndexError, ValueError) as e:
-            print(f"Warning: Could not extract pruning percentage from {model_name}: {e}")
-            continue
+        if percent not in pruning_percentages:
+            pruning_percentages.append(percent)
 
     # Sort pruning percentages
     pruning_percentages.sort()
@@ -922,50 +954,40 @@ def create_plots(results, metric_names, plot_dir):
 
     # Organize metrics by split and percentage
     for model_name, model_results in results.items():
-        try:
-            if "baseline" in model_name:
-                percent = 0
-            else:
+        if "baseline" in model_name:
+            percent = 0
+        else:
+            try:
                 percent = int(model_name.split("_")[1])
-
-            split = "clean" if "clean" in model_name else "other"
-
-            # Check for metrics
-            if "metrics" not in model_results and "error" not in model_results:
-                print(f"Warning: No metrics found for {model_name}")
+            except (IndexError, ValueError):
                 continue
 
-            # Check if metrics contain error
-            if "error" in model_results:
-                print(f"Warning: Error in results for {model_name}: {model_results['error']}")
-                continue
+        split = "clean" if "clean" in model_name else "other"
 
-            if "metrics" in model_results and "error" in model_results["metrics"]:
-                print(
-                    f"Warning: Error in metrics for {model_name}: {model_results['metrics']['error']}"
-                )
-                continue
-
-            # Extract metrics
-            for metric in metric_names:
-                if "metrics" in model_results and metric in model_results["metrics"]:
-                    if (
-                        isinstance(model_results["metrics"][metric], (int, float))
-                        and model_results["metrics"][metric] >= 0
-                    ):
-                        metrics_by_split[split][metric].append(
-                            (percent, model_results["metrics"][metric])
-                        )
-                elif metric in model_results:
-                    # Some metrics might be at the top level
-                    if (
-                        isinstance(model_results[metric], (int, float))
-                        and model_results[metric] >= 0
-                    ):
-                        metrics_by_split[split][metric].append((percent, model_results[metric]))
-        except Exception as e:
-            print(f"Warning: Error processing results for {model_name}: {e}")
+        # Check if we have metrics
+        if "metrics" not in model_results:
+            print(f"Warning: No metrics found for {model_name}")
             continue
+
+        # Check if metrics contain error
+        if "error" in model_results["metrics"]:
+            print(
+                f"Warning: Error in metrics for {model_name}: {model_results['metrics']['error']}"
+            )
+            continue
+
+        # Extract available metrics
+        for metric in metric_names:
+            if metric in model_results.get("metrics", {}):
+                metrics_by_split[split][metric].append((percent, model_results["metrics"][metric]))
+            elif metric in model_results:
+                # Some metrics might be at the top level
+                metrics_by_split[split][metric].append((percent, model_results[metric]))
+            else:
+                print(f"Warning: Metric {metric} not found for {model_name}")
+
+    # Sort by pruning percentage
+    pruning_percentages.sort()
 
     # Create individual plots for each metric
     for metric in metric_names:
@@ -992,16 +1014,9 @@ def create_plots(results, metric_names, plot_dir):
             # Add labels and title
             plt.xlabel("Pruning Percentage (%)")
             plt.ylabel(metric)
-            plt.title(f"{metric} vs L1 Unstructured Pruning Percentage")
+            plt.title(f"{metric} vs Random Pruning Percentage")
             plt.grid(True)
-
-            # Only add legend if we have plotted something
-            if plt.gca().get_legend_handles_labels()[0]:
-                plt.legend()
-            else:
-                print(f"Warning: No data to plot for {metric}")
-                plt.close()
-                continue
+            plt.legend()
 
             # Save the plot
             plot_path = os.path.join(plot_dir, f"{metric}_vs_pruning.png")
@@ -1010,7 +1025,6 @@ def create_plots(results, metric_names, plot_dir):
             print(f"Saved plot to {plot_path}")
         except Exception as e:
             print(f"Error creating plot for {metric}: {e}")
-            plt.close()
 
     # Create model size plot
     try:
@@ -1023,22 +1037,16 @@ def create_plots(results, metric_names, plot_dir):
 
         for percent in pruning_percentages:
             # Find the model result with this percentage (prefer clean split)
-            model_name = f"l1_{percent}_clean" if percent > 0 else "baseline_clean"
+            model_name = f"random_{percent}_clean" if percent > 0 else "baseline_clean"
             if model_name not in results and percent > 0:
-                model_name = f"l1_{percent}_other"
+                model_name = f"random_{percent}_other"
             if model_name not in results and percent == 0:
                 model_name = "baseline_other"
 
             if model_name in results:
-                if (
-                    "model_size_mb" in results[model_name]
-                    and results[model_name]["model_size_mb"] > 0
-                ):
+                if "model_size_mb" in results[model_name]:
                     dense_sizes.append((percent, results[model_name]["model_size_mb"]))
-                if (
-                    "sparse_model_size_mb" in results[model_name]
-                    and results[model_name]["sparse_model_size_mb"] > 0
-                ):
+                if "sparse_model_size_mb" in results[model_name]:
                     sparse_sizes.append((percent, results[model_name]["sparse_model_size_mb"]))
                 if (
                     "theoretical_dense_pruned_size_mb" in results[model_name]
@@ -1078,16 +1086,9 @@ def create_plots(results, metric_names, plot_dir):
 
         plt.xlabel("Pruning Percentage (%)")
         plt.ylabel("Model Size (MB)")
-        plt.title("Model Size vs L1 Unstructured Pruning Percentage")
+        plt.title("Model Size vs Random Pruning Percentage")
         plt.grid(True)
-
-        # Only add legend if we have plotted something
-        if plt.gca().get_legend_handles_labels()[0]:
-            plt.legend()
-        else:
-            print("Warning: No model size data to plot")
-            plt.close()
-            return
+        plt.legend()
 
         # Save the plot
         plot_path = os.path.join(plot_dir, "model_size_vs_pruning.png")
@@ -1096,7 +1097,6 @@ def create_plots(results, metric_names, plot_dir):
         print(f"Saved plot to {plot_path}")
     except Exception as e:
         print(f"Error creating model size plot: {e}")
-        plt.close()
 
     # Create GFLOPs plot
     try:
@@ -1107,15 +1107,14 @@ def create_plots(results, metric_names, plot_dir):
 
         for percent in pruning_percentages:
             # Find the model result with this percentage (prefer clean split)
-            model_name = f"l1_{percent}_clean" if percent > 0 else "baseline_clean"
+            model_name = f"random_{percent}_clean" if percent > 0 else "baseline_clean"
             if model_name not in results and percent > 0:
-                model_name = f"l1_{percent}_other"
+                model_name = f"random_{percent}_other"
             if model_name not in results and percent == 0:
                 model_name = "baseline_other"
 
             if model_name in results and "gflops" in results[model_name]:
-                if results[model_name]["gflops"] > 0:
-                    gflops_data.append((percent, results[model_name]["gflops"]))
+                gflops_data.append((percent, results[model_name]["gflops"]))
 
         # Sort by pruning percentage
         gflops_data.sort(key=lambda x: x[0])
@@ -1126,104 +1125,83 @@ def create_plots(results, metric_names, plot_dir):
                 [p for p, _ in gflops_data], [g for _, g in gflops_data], marker="o", label="GFLOPs"
             )
 
-            plt.xlabel("Pruning Percentage (%)")
-            plt.ylabel("GFLOPs")
-            plt.title("Computational Complexity (GFLOPs) vs L1 Pruning Percentage")
-            plt.grid(True)
-            plt.legend()
+        plt.xlabel("Pruning Percentage (%)")
+        plt.ylabel("GFLOPs")
+        plt.title("Computational Complexity (GFLOPs) vs Random Pruning Percentage")
+        plt.grid(True)
+        plt.legend()
 
-            # Save the plot
-            plot_path = os.path.join(plot_dir, "gflops_vs_pruning.png")
-            plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-            print(f"Saved plot to {plot_path}")
-        else:
-            print("Warning: No GFLOPs data to plot")
-
+        # Save the plot
+        plot_path = os.path.join(plot_dir, "gflops_vs_pruning.png")
+        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
+        print(f"Saved plot to {plot_path}")
     except Exception as e:
         print(f"Error creating GFLOPs plot: {e}")
-        plt.close()
 
 
 def main():
-    # Configuration
+    # Configuration for MPS Mac
     original_model_name = "openai/whisper-small"
-    save_path = L1_PRUNING_DIR
+    save_path = RANDOM_PRUNING_DIR
 
-    # Determine device based on available hardware
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        cuda_device = torch.cuda.get_device_name(0)
-        print(f"Using CUDA - Device: {cuda_device}")
-        default_batch_size = 16  # Standard batch size for CUDA
-    elif (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-        and torch.backends.mps.is_built()
-    ):
+    # Check for MPS availability with better error handling
+    device = torch.device("cpu")  # Default fallback
+
+    # For this test script with only 30 samples, drastically reduce batch sizes
+    # Use extremely small batch sizes to minimize memory usage
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         try:
             # Create a small tensor to test MPS
             test_tensor = torch.zeros(1).to("mps")
             device = torch.device("mps")
             print(f"Using MPS (Metal Performance Shaders) - PyTorch version: {torch.__version__}")
-            # Use smaller batch size for MPS to avoid memory issues
-            default_batch_size = 4
+            # Use only batch size 1 for MPS to avoid memory issues
+            default_batch_size = 1  # Extremely small batch size for MPS
             del test_tensor  # Clean up test tensor
         except Exception as e:
             print(f"MPS detected but failed to initialize: {e}")
             print("Falling back to CPU")
-            device = torch.device("cpu")
-            default_batch_size = 8
+            default_batch_size = 2  # Small batch on CPU
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        cuda_device = torch.cuda.get_device_name(0)
+        print(f"Using CUDA - Device: {cuda_device}")
+        default_batch_size = 4
     else:
-        device = torch.device("cpu")
         print("Using CPU - No GPU acceleration available")
-        default_batch_size = 8
+        default_batch_size = 2
 
-    # Define the pruning percentages to test (0% to 99%)
-    pruning_percentages = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
+    # Define the pruning percentages to test (only 0%, 20%, 40%, 60%, 80%)
+    pruning_percentages = [0, 20, 40, 60, 80]
 
-    # Adjust batch sizes based on pruning level and device
-    batch_sizes = {percent: default_batch_size for percent in pruning_percentages}
-
-    # For higher pruning rates, we can use larger batch sizes (more zeros = less memory)
-    if device.type == "cuda":
-        for percent in [80, 90, 95, 99]:
-            batch_sizes[percent] = min(default_batch_size * 2, 32)  # Increase but cap at 32
-
-    # For MPS or CPU, be more conservative with batch sizes for high pruning
-    elif device.type in ["mps", "cpu"]:
-        for percent in [80, 90, 95, 99]:
-            batch_sizes[percent] = default_batch_size  # Keep the same
+    # Use minimal batch sizes throughout for test script
+    batch_sizes = {
+        0: default_batch_size,
+        20: 1,  # Force batch size 1 for all pruned models
+        40: 1,
+        60: 1,
+        80: 1,
+    }
 
     print(f"Using batch sizes: {batch_sizes}")
 
     # Load processor once - can be shared across models
-    try:
-        processor = WhisperProcessor.from_pretrained(original_model_name)
-    except Exception as e:
-        print(f"Error loading processor: {e}")
-        return
+    processor = WhisperProcessor.from_pretrained(original_model_name)
 
-    # Load full datasets (matching the quantization code)
+    # Load limited datasets (even smaller for testing)
     print("\nLoading datasets...")
-    try:
-        dataset_clean = load_librispeech(split="test.clean")  # Use full test.clean
-        dataset_other = load_librispeech(split="test.other")  # Use full test.other
+    # Use very small samples for memory-constrained testing
+    dataset_clean = load_librispeech(num_samples=10, split="test.clean")  # Reduced from 30 to 10
+    dataset_other = load_librispeech(num_samples=10, split="test.other")  # Reduced from 30 to 10
 
-        print(f"Clean dataset: {len(dataset_clean)} samples")
-        print(f"Other dataset: {len(dataset_other)} samples")
-    except Exception as e:
-        print(f"Error loading datasets: {e}")
-        return
+    print(f"Clean dataset: {len(dataset_clean)} samples")
+    print(f"Other dataset: {len(dataset_other)} samples")
 
     # Process datasets
     print("\nProcessing datasets...")
-    try:
-        processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
-        processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
-    except Exception as e:
-        print(f"Error processing datasets: {e}")
-        return
+    processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
+    processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
 
     # Initialize metrics
     metrics = {"WER": load("wer"), "CER": load("cer")}
@@ -1241,7 +1219,7 @@ def main():
     # Add pruning configurations
     for percent in pruning_percentages:
         if percent > 0:  # Skip 0% as it's already in baseline
-            model_configs[f"l1_{percent}"] = {
+            model_configs[f"random_{percent}"] = {
                 "pruning_amount": percent / 100  # Convert percentage to fraction
             }
 
@@ -1251,7 +1229,7 @@ def main():
         print(f"Evaluating {model_name}")
         print("=" * 50)
 
-        # Get the batch size for this pruning level
+        # Determine batch size based on pruning level
         if "baseline" in model_name:
             current_batch_size = batch_sizes[0]
         else:
@@ -1278,7 +1256,7 @@ def main():
 
             # Calculate model GFLOPs
             try:
-                gflops = calculate_model_gflops(model)
+                gflops = calculate_model_gflops(model, detailed=True)
                 print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
             except Exception as e:
                 print(f"Error calculating GFLOPs: {e}")
@@ -1349,7 +1327,7 @@ def main():
                 tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
                 try:
-                    # Run evaluation with appropriate batch size
+                    # Run evaluation with appropriate batch size for this pruning level
                     scores, transcriptions = evaluate_model(
                         model=model,
                         processor=processor,
@@ -1360,36 +1338,34 @@ def main():
                         split=split,
                     )
 
-                    # Store and save results
-                    if isinstance(scores, dict) and "error" not in scores:
-                        # Update results with scores
+                    # Update results with scores
+                    if scores is not None:
+                        # Update existing result dictionary with scores
                         results[result_key]["metrics"] = scores
 
                         # Save metrics
-                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
-                        with open(metrics_path, "w") as f:
-                            json.dump(results[result_key], f, indent=2)
+                        try:
+                            with open(metrics_path, "w") as f:
+                                json.dump(results[result_key], f, indent=2)
+                            print(f"Saved metrics to {metrics_path}")
+                        except Exception as e:
+                            print(f"Error saving metrics: {e}")
 
                         # Save transcriptions
-                        transcriptions_path = os.path.join(
-                            save_path, f"{model_name}_{split}_transcriptions.json"
-                        )
-                        with open(transcriptions_path, "w") as f:
-                            json.dump(transcriptions, f, indent=2)
-                    else:
-                        # Handle error
-                        error_msg = (
-                            scores.get("error", "Unknown error")
-                            if isinstance(scores, dict)
-                            else str(scores)
-                        )
-                        print(f"Error during evaluation: {error_msg}")
-                        results[result_key]["evaluation_error"] = error_msg
+                        try:
+                            transcriptions_path = os.path.join(
+                                save_path, f"{model_name}_{split}_transcriptions.json"
+                            )
+                            with open(transcriptions_path, "w") as f:
+                                json.dump(transcriptions, f, indent=2)
+                            print(f"Saved transcriptions to {transcriptions_path}")
+                        except Exception as e:
+                            print(f"Error saving transcriptions: {e}")
 
                 except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
+                    if "MPS backend out of memory" in str(e) or "CUDA out of memory" in str(e):
                         print(f"Memory error during evaluation: {e}")
-                        print("Suggestion: Try reducing batch size further")
+                        print("Suggestion: Try reducing batch size further or switch to CPU")
                         # Add memory error information to results
                         results[result_key]["evaluation_error"] = f"Out of memory: {e!s}"
                         results[result_key]["metrics"] = {"error": "evaluation_failed"}
@@ -1398,7 +1374,7 @@ def main():
                         results[result_key]["evaluation_error"] = str(e)
                         results[result_key]["metrics"] = {"error": "evaluation_failed"}
                 except Exception as e:
-                    print(f"Error evaluating {model_name} on {split} split: {e}")
+                    print(f"Error evaluating {model_name} on {split} split: {e!s}")
                     results[result_key]["evaluation_error"] = str(e)
                     results[result_key]["metrics"] = {"error": "evaluation_failed"}
                 finally:
@@ -1412,29 +1388,35 @@ def main():
                     gc.collect()
 
             # Save sparse model if this is a pruned model
+            sparse_size = 0
             if "baseline" not in model_name:
                 try:
                     sparse_model_path = os.path.join(MODELS_DIR, f"{model_name}_sparse.pt")
                     sparse_size = save_sparse_model(model, sparse_model_path)
+                    print(f"Saved sparse model to {sparse_model_path}, size: {sparse_size:.2f} MB")
 
-                    # Update results with sparse model size
+                    # Update all results for this model with sparse model size
                     for split in ["clean", "other"]:
                         result_key = f"{model_name}_{split}"
                         if result_key in results:
                             results[result_key]["sparse_model_size_mb"] = sparse_size
                             if results[result_key]["model_size_mb"] > 0:
-                                results[result_key]["size_reduction_percent"] = (
+                                reduction = (
                                     100.0
                                     * (results[result_key]["model_size_mb"] - sparse_size)
                                     / results[result_key]["model_size_mb"]
                                 )
+                                results[result_key]["size_reduction_percent"] = reduction
 
                             # Update the saved metrics file
-                            metrics_path = os.path.join(
-                                save_path, f"{model_name}_{split}_metrics.json"
-                            )
-                            with open(metrics_path, "w") as f:
-                                json.dump(results[result_key], f, indent=2)
+                            try:
+                                metrics_path = os.path.join(
+                                    save_path, f"{model_name}_{split}_metrics.json"
+                                )
+                                with open(metrics_path, "w") as f:
+                                    json.dump(results[result_key], f, indent=2)
+                            except Exception as e:
+                                print(f"Error updating metrics file with sparse size: {e}")
                 except Exception as e:
                     print(f"Error saving sparse model: {e}")
 
@@ -1443,53 +1425,42 @@ def main():
             clear_gpu_memory()
 
         except Exception as e:
-            print(f"Error setting up {model_name}: {e}")
+            print(f"Error setting up {model_name}: {e!s}")
             continue
 
     # Save all results to a single file
-    try:
-        all_results_path = os.path.join(L1_PRUNING_DIR, "all_results.json")
-        with open(all_results_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"All results saved to {all_results_path}")
-    except Exception as e:
-        print(f"Error saving all results: {e}")
+    all_results_path = os.path.join(RANDOM_PRUNING_DIR, "all_results.json")
+    with open(all_results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"All results saved to {all_results_path}")
 
     # Create plots
-    try:
-        create_plots(
-            results=results,
-            metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"],
-            plot_dir=PLOTS_DIR,
-        )
-    except Exception as e:
-        print(f"Error creating plots: {e}")
+    create_plots(
+        results=results,
+        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb", "gflops"],
+        plot_dir=PLOTS_DIR,
+    )
 
     # Print summary
     print("\n" + "=" * 60)
-    print("L1 UNSTRUCTURED PRUNING EXPERIMENT SUMMARY")
+    print("RANDOM PRUNING EXPERIMENT SUMMARY")
     print("=" * 60)
 
     print("\nBaseline (0% pruning):")
     if "baseline_clean" in results:
         baseline = results["baseline_clean"]
-        if "metrics" in baseline and "WER" in baseline["metrics"]:
-            print(f"  WER: {baseline['metrics']['WER']:.4f}")
-        if "metrics" in baseline and "CER" in baseline["metrics"]:
-            print(f"  CER: {baseline['metrics']['CER']:.4f}")
-        if "metrics" in baseline and "RTF" in baseline["metrics"]:
-            print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
-        if "model_size_mb" in baseline:
-            print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
-        if "gflops" in baseline:
-            print(f"  GFLOPs: {baseline['gflops']:.4f}")
+        print(f"  WER: {baseline['metrics']['WER']:.4f}")
+        print(f"  CER: {baseline['metrics']['CER']:.4f}")
+        print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
+        print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
+        print(f"  GFLOPs: {baseline['gflops']:.4f}")
 
     print("\nResults for different pruning percentages:")
     for percent in pruning_percentages:
         if percent == 0:
             continue
 
-        model_key = f"l1_{percent}_clean"
+        model_key = f"random_{percent}_clean"
         if model_key in results:
             result = results[model_key]
 
@@ -1503,36 +1474,23 @@ def main():
             if "baseline_clean" in results:
                 baseline = results["baseline_clean"]
 
-                # Calculate metric changes
-                if (
-                    "metrics" in result
-                    and "WER" in result["metrics"]
-                    and "metrics" in baseline
-                    and "WER" in baseline["metrics"]
-                ):
+                # Calculate WER and CER changes without capping
+                if "metrics" in result and "WER" in result["metrics"]:
                     wer = result["metrics"]["WER"]
                     wer_change = f"{(wer - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
 
-                if (
-                    "metrics" in result
-                    and "CER" in result["metrics"]
-                    and "metrics" in baseline
-                    and "CER" in baseline["metrics"]
-                ):
+                if "metrics" in result and "CER" in result["metrics"]:
                     cer = result["metrics"]["CER"]
                     cer_change = f"{(cer - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
 
-                if (
-                    "metrics" in result
-                    and "RTF" in result["metrics"]
-                    and "metrics" in baseline
-                    and "RTF" in baseline["metrics"]
-                ):
+                if "metrics" in result and "RTF" in result["metrics"]:
                     rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
 
                 # Check if sparse model size exists
-                if "sparse_model_size_mb" in result and "model_size_mb" in baseline:
+                if "sparse_model_size_mb" in result:
                     size_change = f"{(result['sparse_model_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
+                else:
+                    size_change = "N/A"
 
                 if "gflops" in result and "gflops" in baseline:
                     gflops_change = f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
@@ -1552,9 +1510,7 @@ def main():
                 "theoretical_dense_pruned_size_mb" in result
                 and result["theoretical_dense_pruned_size_mb"] > 0
             ):
-                theoretical_change = "-"
-                if "model_size_mb" in baseline:
-                    theoretical_change = f"{(result['theoretical_dense_pruned_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
+                theoretical_change = f"{(result['theoretical_dense_pruned_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
                 print(
                     f"  Theoretical Dense Pruned Size: {result['theoretical_dense_pruned_size_mb']:.2f} MB ({theoretical_change})"
                 )
@@ -1565,7 +1521,7 @@ def main():
 
     print("\nPlots saved to:", PLOTS_DIR)
     print("Sparse models saved to:", MODELS_DIR)
-    print("Detailed metrics saved to:", L1_PRUNING_DIR)
+    print("Detailed metrics saved to:", RANDOM_PRUNING_DIR)
 
 
 if __name__ == "__main__":

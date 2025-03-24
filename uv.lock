@@ -195,19 +195,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bitsandbytes"
-version = "0.43.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy" },
-    { name = "torch" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/72/e5/06ed351cdf8d1d5bf7eb86729e4e3669c6844654354aef3b1bc9da66d0bb/bitsandbytes-0.43.2-py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:80fbc0f41dded735f51328042d3d45ea640101d87c8abba8ea5bfafa61e2a786", size = 137460434 },
-    { url = "https://files.pythonhosted.org/packages/86/72/32b06cfe80852d9a60fa8c9169b3712e556ad794d67896022e254d70da56/bitsandbytes-0.43.2-py3-none-win_amd64.whl", hash = "sha256:89e1c506fd2323574615d668ca7eacad4f83db4847044bf2db87580a71852ff1", size = 136479862 },
-]
-
-[[package]]
 name = "cachetools"
 version = "5.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1912,7 +1899,6 @@ dependencies = [
     { name = "asttokens" },
     { name = "attrs" },
     { name = "audioread" },
-    { name = "bitsandbytes" },
     { name = "certifi" },
     { name = "cffi" },
     { name = "charset-normalizer" },
@@ -2045,7 +2031,6 @@ requires-dist = [
     { name = "asttokens", specifier = "==3.0.0" },
     { name = "attrs", specifier = "==24.2.0" },
     { name = "audioread", specifier = "==3.0.1" },
-    { name = "bitsandbytes", specifier = "==0.43.2" },
     { name = "certifi", specifier = "==2024.8.30" },
     { name = "cffi", specifier = "==1.17.1" },
     { name = "charset-normalizer", specifier = "==3.4.0" },
