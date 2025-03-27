@@ -20,7 +20,7 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 sns.set(style="whitegrid")
 
 # Create results directory
-RESULTS_DIR = "whisper_pruning_results"
+RESULTS_DIR = "pruning/whisper_pruning_results"
 L1_PRUNING_DIR = os.path.join(RESULTS_DIR, "l1_pruning")
 PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
 MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
