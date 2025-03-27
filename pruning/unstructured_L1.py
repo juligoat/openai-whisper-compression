@@ -564,18 +564,8 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
         WhisperForConditionalGeneration model
     """
     try:
-        # Set torch dtype based on device for better performance
-        torch_dtype = torch.float32
-        if device.type == "cuda":
-            torch_dtype = torch.float16  # Use half precision on CUDA
-        # MPS and CPU perform best with float32
-
-        print(f"Loading model with dtype: {torch_dtype}")
-
-        # Load model with appropriate dtype
-        model = WhisperForConditionalGeneration.from_pretrained(
-            model_name, device_map=None, torch_dtype=torch_dtype
-        )
+        # Load model without device_map
+        model = WhisperForConditionalGeneration.from_pretrained(model_name, device_map=None)
 
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
@@ -586,17 +576,9 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
             sparsity = calculate_sparsity(model)
             print(f"Model sparsity after pruning: {sparsity:.2f}%")
 
-        # Print device information
-        print(f"Moving model to device: {device} (type: {device.type})")
-
         # Move model to device
         model = model.to(device)
         model.config.forced_decoder_ids = None
-
-        # Verify device placement
-        param_device = next(model.parameters()).device
-        print(f"Model parameters are on: {param_device}")
-
         return model
 
     except Exception as e:
@@ -668,7 +650,10 @@ def transcribe_batch(batch, model, processor, memory_tracker, split, batch_idx):
         except Exception as e:
             print(f"Error during generation: {e}")
             # Clean up in case of error
-            del features
+            try:
+                del features
+            except NameError:
+                pass  # features wasn't defined yet
             gc.collect()
             raise
 
@@ -840,33 +825,28 @@ def load_librispeech(num_samples=None, split="test.clean"):
     """
     Load LibriSpeech clean/other data.
     """
-    try:
-        if num_samples:
-            # Stream partial dataset
-            stream_dataset = datasets.load_dataset(
-                "librispeech_asr", split=split, streaming=True, trust_remote_code=True
-            )
-            dataset = datasets.Dataset.from_dict(
-                {
-                    k: [sample[k] for sample in list(stream_dataset.take(num_samples))]
-                    for k in next(iter(stream_dataset)).keys()
-                }
-            )
-        else:
-            # Load full dataset
-            dataset = datasets.load_dataset("librispeech_asr", split=split)
-
-        total_duration_seconds = sum(
-            len(sample["audio"]["array"]) / sample["audio"]["sampling_rate"] for sample in dataset
+    if num_samples:
+        # Stream partial dataset
+        stream_dataset = datasets.load_dataset(
+            "librispeech_asr", split=split, streaming=True, trust_remote_code=True
         )
-        total_hours = total_duration_seconds / 3600
+        dataset = datasets.Dataset.from_dict(
+            {
+                k: [sample[k] for sample in list(stream_dataset.take(num_samples))]
+                for k in next(iter(stream_dataset)).keys()
+            }
+        )
+    else:
+        # Load full dataset
+        dataset = datasets.load_dataset("librispeech_asr", split=split)
+    total_duration_seconds = sum(
+        len(sample["audio"]["array"]) / sample["audio"]["sampling_rate"] for sample in dataset
+    )
+    total_hours = total_duration_seconds / 3600
 
-        print(f"Loaded {len(dataset)} test samples")
-        print(f"Total audio duration: {total_hours:.4f} hours")
-        return dataset
-    except Exception as e:
-        print(f"Error loading dataset: {e}")
-        raise
+    print(f"Loaded {len(dataset)} test samples")
+    print(f"Total audio duration: {total_hours:.4f} hours")
+    return dataset
 
 
 def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
@@ -1146,84 +1126,31 @@ def create_plots(results, metric_names, plot_dir):
 
 
 def main():
-    # Configuration
+    # Configuration to match the quantization code
     original_model_name = "openai/whisper-small"
+    batch_size = 16  # Match the quantization code batch size
     save_path = L1_PRUNING_DIR
-
-    # Determine device based on available hardware
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        cuda_device = torch.cuda.get_device_name(0)
-        print(f"Using CUDA - Device: {cuda_device}")
-        default_batch_size = 16  # Standard batch size for CUDA
-    elif (
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-        and torch.backends.mps.is_built()
-    ):
-        try:
-            # Create a small tensor to test MPS
-            test_tensor = torch.zeros(1).to("mps")
-            device = torch.device("mps")
-            print(f"Using MPS (Metal Performance Shaders) - PyTorch version: {torch.__version__}")
-            # Use smaller batch size for MPS to avoid memory issues
-            default_batch_size = 4
-            del test_tensor  # Clean up test tensor
-        except Exception as e:
-            print(f"MPS detected but failed to initialize: {e}")
-            print("Falling back to CPU")
-            device = torch.device("cpu")
-            default_batch_size = 8
-    else:
-        device = torch.device("cpu")
-        print("Using CPU - No GPU acceleration available")
-        default_batch_size = 8
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print(f"Using {device}")
 
     # Define the pruning percentages to test (0% to 99%)
     pruning_percentages = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
 
-    # Adjust batch sizes based on pruning level and device
-    batch_sizes = {percent: default_batch_size for percent in pruning_percentages}
-
-    # For higher pruning rates, we can use larger batch sizes (more zeros = less memory)
-    if device.type == "cuda":
-        for percent in [80, 90, 95, 99]:
-            batch_sizes[percent] = min(default_batch_size * 2, 32)  # Increase but cap at 32
-
-    # For MPS or CPU, be more conservative with batch sizes for high pruning
-    elif device.type in ["mps", "cpu"]:
-        for percent in [80, 90, 95, 99]:
-            batch_sizes[percent] = default_batch_size  # Keep the same
-
-    print(f"Using batch sizes: {batch_sizes}")
-
     # Load processor once - can be shared across models
-    try:
-        processor = WhisperProcessor.from_pretrained(original_model_name)
-    except Exception as e:
-        print(f"Error loading processor: {e}")
-        return
+    processor = WhisperProcessor.from_pretrained(original_model_name)
 
     # Load full datasets (matching the quantization code)
     print("\nLoading datasets...")
-    try:
-        dataset_clean = load_librispeech(split="test.clean")  # Use full test.clean
-        dataset_other = load_librispeech(split="test.other")  # Use full test.other
+    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")  # Use full test.clean
+    dataset_other = load_librispeech(num_samples=2939, split="test.other")  # Use full test.other
 
-        print(f"Clean dataset: {len(dataset_clean)} samples")
-        print(f"Other dataset: {len(dataset_other)} samples")
-    except Exception as e:
-        print(f"Error loading datasets: {e}")
-        return
+    print(f"Clean dataset: {len(dataset_clean)} samples")
+    print(f"Other dataset: {len(dataset_other)} samples")
 
     # Process datasets
     print("\nProcessing datasets...")
-    try:
-        processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
-        processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
-    except Exception as e:
-        print(f"Error processing datasets: {e}")
-        return
+    processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
+    processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
 
     # Initialize metrics
     metrics = {"WER": load("wer"), "CER": load("cer")}
@@ -1251,15 +1178,6 @@ def main():
         print(f"Evaluating {model_name}")
         print("=" * 50)
 
-        # Get the batch size for this pruning level
-        if "baseline" in model_name:
-            current_batch_size = batch_sizes[0]
-        else:
-            percent = int(model_name.split("_")[1])
-            current_batch_size = batch_sizes[percent]
-
-        print(f"Using batch size: {current_batch_size}")
-
         # Clear memory before loading new model
         clear_gpu_memory()
 
@@ -1277,37 +1195,25 @@ def main():
             print(f"Actual model sparsity: {sparsity:.2f}%")
 
             # Calculate model GFLOPs
-            try:
-                gflops = calculate_model_gflops(model)
-                print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
-            except Exception as e:
-                print(f"Error calculating GFLOPs: {e}")
-                gflops = 0.0
+            gflops = calculate_model_gflops(model)
+            print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
 
             # Get model size before evaluation
-            try:
-                model_size = get_model_disk_size_in_mb(model)
-                print(f"Model size: {model_size:.2f} MB")
-            except Exception as e:
-                print(f"Error calculating model size: {e}")
-                model_size = 0.0
+            model_size = get_model_disk_size_in_mb(model)
+            print(f"Model size: {model_size:.2f} MB")
 
             # Calculate theoretical size of a dense model with pruned weights removed
             theoretical_dense_pruned_size = 0.0
             if config["pruning_amount"] is not None and config["pruning_amount"] > 0:
-                try:
-                    # Calculate what the size would be if we removed zeros (without actually creating the model)
-                    theoretical_dense_pruned_size = calculate_pruned_dense_size(
-                        model, pruning_threshold=0.0
-                    )
-                    print(
-                        f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
-                    )
-                except Exception as e:
-                    print(f"Error calculating theoretical dense pruned size: {e}")
+                # Calculate what the size would be if we removed zeros (without actually creating the model)
+                theoretical_dense_pruned_size = calculate_pruned_dense_size(
+                    model, pruning_threshold=0.0
+                )
+                print(
+                    f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
+                )
 
-            # Initialize result dictionary with basic info even before evaluation
-            # This ensures we have at least some data if evaluation fails
+            # Initialize result dictionary with basic info
             model_result_base = {
                 "model_type": model_name,
                 "pruning_percentage": 0
@@ -1329,7 +1235,6 @@ def main():
                 if split_index > 0:
                     print("Clearing memory between dataset evaluations...")
                     clear_gpu_memory()
-                    gc.collect()
 
                 # Create a result key
                 result_key = f"{model_name}_{split}"
@@ -1339,24 +1244,21 @@ def main():
 
                 # Save initial metrics with what we know so far
                 metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
-                try:
-                    with open(metrics_path, "w") as f:
-                        json.dump(results[result_key], f, indent=2)
-                except Exception as e:
-                    print(f"Warning: Could not save initial metrics: {e}")
+                with open(metrics_path, "w") as f:
+                    json.dump(results[result_key], f, indent=2)
 
                 # Initialize memory tracker for this run
                 tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
                 try:
-                    # Run evaluation with appropriate batch size
+                    # Run evaluation
                     scores, transcriptions = evaluate_model(
                         model=model,
                         processor=processor,
                         dataset=dataset,
                         metrics=metrics,
                         memory_tracker=tracker,
-                        batch_size=current_batch_size,
+                        batch_size=batch_size,
                         split=split,
                     )
 
@@ -1366,7 +1268,6 @@ def main():
                         results[result_key]["metrics"] = scores
 
                         # Save metrics
-                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
                         with open(metrics_path, "w") as f:
                             json.dump(results[result_key], f, indent=2)
 
@@ -1386,57 +1287,35 @@ def main():
                         print(f"Error during evaluation: {error_msg}")
                         results[result_key]["evaluation_error"] = error_msg
 
-                except RuntimeError as e:
-                    if "out of memory" in str(e).lower():
-                        print(f"Memory error during evaluation: {e}")
-                        print("Suggestion: Try reducing batch size further")
-                        # Add memory error information to results
-                        results[result_key]["evaluation_error"] = f"Out of memory: {e!s}"
-                        results[result_key]["metrics"] = {"error": "evaluation_failed"}
-                    else:
-                        print(f"Runtime error evaluating {model_name} on {split} split: {e!s}")
-                        results[result_key]["evaluation_error"] = str(e)
-                        results[result_key]["metrics"] = {"error": "evaluation_failed"}
                 except Exception as e:
                     print(f"Error evaluating {model_name} on {split} split: {e}")
                     results[result_key]["evaluation_error"] = str(e)
-                    results[result_key]["metrics"] = {"error": "evaluation_failed"}
+
                 finally:
                     # Always close tracker and clear memory
-                    try:
-                        tracker.close()
-                    except Exception as e:
-                        print(f"Error closing tracker: {e}")
-
-                    # Force garbage collection
-                    gc.collect()
+                    tracker.close()
+                    clear_gpu_memory()
 
             # Save sparse model if this is a pruned model
             if "baseline" not in model_name:
-                try:
-                    sparse_model_path = os.path.join(MODELS_DIR, f"{model_name}_sparse.pt")
-                    sparse_size = save_sparse_model(model, sparse_model_path)
+                sparse_model_path = os.path.join(MODELS_DIR, f"{model_name}_sparse.pt")
+                sparse_size = save_sparse_model(model, sparse_model_path)
 
-                    # Update results with sparse model size
-                    for split in ["clean", "other"]:
-                        result_key = f"{model_name}_{split}"
-                        if result_key in results:
-                            results[result_key]["sparse_model_size_mb"] = sparse_size
-                            if results[result_key]["model_size_mb"] > 0:
-                                results[result_key]["size_reduction_percent"] = (
-                                    100.0
-                                    * (results[result_key]["model_size_mb"] - sparse_size)
-                                    / results[result_key]["model_size_mb"]
-                                )
+                # Update results with sparse model size
+                for split in ["clean", "other"]:
+                    result_key = f"{model_name}_{split}"
+                    if result_key in results:
+                        results[result_key]["sparse_model_size_mb"] = sparse_size
+                        results[result_key]["size_reduction_percent"] = (
+                            100.0
+                            * (results[result_key]["model_size_mb"] - sparse_size)
+                            / results[result_key]["model_size_mb"]
+                        )
 
-                            # Update the saved metrics file
-                            metrics_path = os.path.join(
-                                save_path, f"{model_name}_{split}_metrics.json"
-                            )
-                            with open(metrics_path, "w") as f:
-                                json.dump(results[result_key], f, indent=2)
-                except Exception as e:
-                    print(f"Error saving sparse model: {e}")
+                        # Update the saved metrics file
+                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
+                        with open(metrics_path, "w") as f:
+                            json.dump(results[result_key], f, indent=2)
 
             # Clear model from memory
             del model
@@ -1447,23 +1326,17 @@ def main():
             continue
 
     # Save all results to a single file
-    try:
-        all_results_path = os.path.join(L1_PRUNING_DIR, "all_results.json")
-        with open(all_results_path, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"All results saved to {all_results_path}")
-    except Exception as e:
-        print(f"Error saving all results: {e}")
+    all_results_path = os.path.join(L1_PRUNING_DIR, "all_results.json")
+    with open(all_results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"All results saved to {all_results_path}")
 
     # Create plots
-    try:
-        create_plots(
-            results=results,
-            metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"],
-            plot_dir=PLOTS_DIR,
-        )
-    except Exception as e:
-        print(f"Error creating plots: {e}")
+    create_plots(
+        results=results,
+        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"],
+        plot_dir=PLOTS_DIR,
+    )
 
     # Print summary
     print("\n" + "=" * 60)
