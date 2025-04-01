@@ -515,8 +515,10 @@ def apply_l2_structured_pruning(model, amount=0.3, target_modules=None, make_per
         permanent_count = 0
         for module, param_name in params_to_prune:
             try:
-                prune.remove(module, param_name)
-                permanent_count += 1
+                # Only make permanent if the module has a weight_mask attribute
+                if hasattr(module, f"{param_name}_mask"):
+                    prune.remove(module, param_name)
+                    permanent_count += 1
             except Exception as e:
                 print(f"Could not make pruning permanent for {module}: {e}")
         print(f"Made pruning permanent for {permanent_count}/{len(params_to_prune)} modules")
@@ -757,7 +759,8 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
         result = dataset.map(process_batch, batched=True, batch_size=batch_size)
     except Exception as e:
         print(f"Error during dataset mapping: {e}")
-        return {"error": str(e)}, [], []
+        return {"error": str(e)}, None
+
     end = time.time()
 
     # Calculate overall RTF from the accumulated totals
@@ -822,7 +825,8 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
     print(f"Total processing time: {total_processing_time:.2f} s")
     print(f"Total audio duration: {total_audio_duration:.2f} s")
 
-    return scores, {"references": result["reference"], "predictions": result["prediction"]}
+    # FIX: Return only two values to match the unpacking in the main function
+    return scores, result
 
 
 def load_librispeech(num_samples=None, split="test.clean"):
@@ -876,46 +880,81 @@ def create_plots(results, metric_names, plot_dir):
     pruning_percentages = []
     metrics_by_split = {"clean": {}, "other": {}}
 
+    # Initialize metrics for each split
+    for split in ["clean", "other"]:
+        for metric in metric_names:
+            metrics_by_split[split][metric] = []
+
+    # Process results and gather data for plotting
     for model_name, model_results in results.items():
         if "baseline" in model_name:
             percent = 0
         else:
             # Extract percentage from model name (e.g., "l2_10")
-            percent = int(model_name.split("_")[1])
+            try:
+                percent = int(model_name.split("_")[1])
+            except (IndexError, ValueError):
+                print(f"Skipping invalid model name: {model_name}")
+                continue
 
-        split = "clean" if "clean" in model_name else "other"
+        # Determine which split this model belongs to
+        if "_clean" in model_name:
+            split = "clean"
+        elif "_other" in model_name:
+            split = "other"
+        else:
+            print(f"Cannot determine split for model: {model_name}, skipping")
+            continue
 
+        # Add percent to pruning_percentages list if not already there
         if percent not in pruning_percentages:
             pruning_percentages.append(percent)
 
+        # Check if metrics exist in the model results
+        if "metrics" not in model_results:
+            print(f"No metrics found for {model_name}, skipping")
+            continue
+
+        # Add data points for each metric
         for metric in metric_names:
-            if metric not in metrics_by_split[split]:
-                metrics_by_split[split][metric] = []
+            if metric in model_results["metrics"]:
+                metrics_by_split[split][metric].append((percent, model_results["metrics"][metric]))
+            else:
+                print(f"Metric {metric} not found for {model_name}")
 
-            metrics_by_split[split][metric].append((percent, model_results["metrics"][metric]))
-
-    # Sort by pruning percentage
+    # Sort pruning percentages
     pruning_percentages.sort()
 
     # Create individual plots for each metric
     for metric in metric_names:
         plt.figure(figsize=(10, 6))
+        legend_entries = []
 
         # Plot for both splits
         for split in ["clean", "other"]:
             # Sort data points by pruning percentage
             data_points = sorted(metrics_by_split[split][metric])
+
+            # Skip if no data points for this metric and split
+            if not data_points:
+                print(f"No data points for {metric} in {split} split, skipping")
+                continue
+
             x = [p for p, _ in data_points]
             y = [v for _, v in data_points]
 
             plt.plot(x, y, marker="o", label=f"{split} split")
+            legend_entries.append(f"{split} split")
 
         # Add labels and title
         plt.xlabel("Pruning Percentage (%)")
         plt.ylabel(metric)
         plt.title(f"{metric} vs L2 Structured Pruning Percentage")
         plt.grid(True)
-        plt.legend()
+
+        # Only add legend if we have plot lines
+        if legend_entries:
+            plt.legend()
 
         # Save the plot
         plot_path = os.path.join(plot_dir, f"{metric}_vs_pruning.png")
@@ -939,7 +978,8 @@ def create_plots(results, metric_names, plot_dir):
             model_name = "baseline_other"
 
         if model_name in results:
-            dense_sizes.append((percent, results[model_name]["model_size_mb"]))
+            if "model_size_mb" in results[model_name]:
+                dense_sizes.append((percent, results[model_name]["model_size_mb"]))
             if "theoretical_dense_pruned_size_mb" in results[model_name]:
                 theoretical_dense_pruned_sizes.append(
                     (percent, results[model_name]["theoretical_dense_pruned_size_mb"])
@@ -1099,8 +1139,8 @@ def main():
 
     # Load full datasets (matching the quantization code)
     print("\nLoading datasets...")
-    dataset_clean = load_librispeech(split="test.clean")  # Use full test.clean
-    dataset_other = load_librispeech(split="test.other")  # Use full test.other
+    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")  # Use full test.clean
+    dataset_other = load_librispeech(num_samples=2939, split="test.other")  # Use full test.other
 
     print(f"Clean dataset: {len(dataset_clean)} samples")
     print(f"Other dataset: {len(dataset_other)} samples")
@@ -1169,8 +1209,8 @@ def main():
                 tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
                 try:
-                    # Run evaluation
-                    scores, references, predictions = evaluate_model(
+                    # FIX: Unpack only two values from evaluate_model
+                    scores, result = evaluate_model(
                         model=model,
                         processor=processor,
                         dataset=dataset,
@@ -1215,6 +1255,7 @@ def main():
                         metrics_path = os.path.join(save_path, f"{model_name}_{split}_summary.json")
                         with open(metrics_path, "w") as f:
                             json.dump(results[f"{model_name}_{split}"], f, indent=2)
+                        print(f"Saved metrics to {metrics_path}")
 
                 except Exception as e:
                     print(f"Error evaluating {model_name} on {split} split: {e!s}")
@@ -1257,12 +1298,22 @@ def main():
         json.dump(results, f, indent=2)
     print(f"All results saved to {all_results_path}")
 
-    # Create plots
-    create_plots(
-        results=results,
-        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "ram_usage_gb", "gflops"],
-        plot_dir=PLOTS_DIR,
-    )
+    # FIX: Use a safer list of metrics for plotting
+    safe_metrics = []
+    for metric in ["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"]:
+        # Check if at least one result has this metric
+        has_metric = False
+        for model_result in results.values():
+            if "metrics" in model_result and metric in model_result["metrics"]:
+                has_metric = True
+                break
+        if has_metric:
+            safe_metrics.append(metric)
+
+    print(f"Plotting the following metrics: {safe_metrics}")
+
+    # Create plots with the validated metrics
+    create_plots(results=results, metric_names=safe_metrics, plot_dir=PLOTS_DIR)
 
     # Print summary
     print("\n" + "=" * 60)
@@ -1299,25 +1350,33 @@ def main():
 
             if "baseline_clean" in results:
                 baseline = results["baseline_clean"]
-                wer_change = f"{(result['metrics']['WER'] - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
-                cer_change = f"{(result['metrics']['CER'] - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
-                rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
+                if "WER" in result["metrics"] and "WER" in baseline["metrics"]:
+                    wer_change = f"{(result['metrics']['WER'] - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
+                if "CER" in result["metrics"] and "CER" in baseline["metrics"]:
+                    cer_change = f"{(result['metrics']['CER'] - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
+                if "RTF" in result["metrics"] and "RTF" in baseline["metrics"]:
+                    rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
 
                 if (
                     "theoretical_dense_pruned_size_mb" in result
                     and result["theoretical_dense_pruned_size_mb"] > 0
+                    and "model_size_mb" in baseline
                 ):
                     theoretical_size_change = f"{(result['theoretical_dense_pruned_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
 
-                gflops_change = (
-                    f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
-                )
-                param_change = f"{(result['non_zero_parameters'] - baseline['non_zero_parameters']) / baseline['non_zero_parameters'] * 100:+.2f}%"
+                if "gflops" in result and "gflops" in baseline:
+                    gflops_change = f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
+
+                if "non_zero_parameters" in result and "non_zero_parameters" in baseline:
+                    param_change = f"{(result['non_zero_parameters'] - baseline['non_zero_parameters']) / baseline['non_zero_parameters'] * 100:+.2f}%"
 
             print(f"\n{percent}% pruning:")
-            print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
-            print(f"  CER: {result['metrics']['CER']:.4f} ({cer_change})")
-            print(f"  RTF: {result['metrics']['RTF']:.4f} ({rtf_change})")
+            if "WER" in result["metrics"]:
+                print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
+            if "CER" in result["metrics"]:
+                print(f"  CER: {result['metrics']['CER']:.4f} ({cer_change})")
+            if "RTF" in result["metrics"]:
+                print(f"  RTF: {result['metrics']['RTF']:.4f} ({rtf_change})")
 
             if (
                 "theoretical_dense_pruned_size_mb" in result
@@ -1327,10 +1386,17 @@ def main():
                     f"  Theoretical Dense Pruned Size: {result['theoretical_dense_pruned_size_mb']:.2f} MB ({theoretical_size_change})"
                 )
 
-            print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
-            print(f"  Actual Sparsity: {result['actual_sparsity']:.2f}%")
-            print(f"  Total Parameters: {result['total_parameters']:,}")
-            print(f"  Non-zero Parameters: {result['non_zero_parameters']:,} ({param_change})")
+            if "gflops" in result:
+                print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
+
+            if "actual_sparsity" in result:
+                print(f"  Actual Sparsity: {result['actual_sparsity']:.2f}%")
+
+            if "total_parameters" in result:
+                print(f"  Total Parameters: {result['total_parameters']:,}")
+
+            if "non_zero_parameters" in result:
+                print(f"  Non-zero Parameters: {result['non_zero_parameters']:,} ({param_change})")
 
     print("\nPlots saved to:", PLOTS_DIR)
     print("Sparse models saved to:", MODELS_DIR)

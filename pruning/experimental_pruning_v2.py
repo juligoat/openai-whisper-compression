@@ -28,6 +28,351 @@ for directory in [RESULTS_DIR, SELECTIVE_PRUNING_DIR, PLOTS_DIR, MODELS_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 
+def apply_l2_structured_pruning_to_layers(model, target_layers, amount=0.4):
+    """
+    Apply L2 structured pruning to specific layers.
+
+    Args:
+        model: The model to prune
+        target_layers: List of layer indices to target
+        amount: Pruning amount (0.0 to 1.0)
+
+    Returns:
+        Pruned model
+    """
+    print(f"Applying L2 structured pruning with amount={amount} to layers: {target_layers}")
+
+    total_pruned = 0
+    total_params = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # Extract layer index if possible
+            layer_idx = -1
+            if "layers." in name:
+                try:
+                    layer_str = name.split("layers.")[1].split(".")[0]
+                    layer_idx = int(layer_str)
+                except (ValueError, IndexError):
+                    pass
+
+            # If this module is in a target layer
+            if layer_idx in target_layers:
+                try:
+                    # Apply L2 structured pruning
+                    prune.ln_structured(module, "weight", amount=amount, n=2, dim=0)
+                    print(f"  Applied L2 structured pruning to {name}")
+
+                    # Count parameters
+                    total_params += module.weight.numel()
+                    total_pruned += (module.weight == 0).sum().item()
+                except Exception as e:
+                    print(f"  Error applying L2 structured pruning to {name}: {e}")
+
+    # Make pruning permanent
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+
+    if total_params > 0:
+        sparsity = 100.0 * total_pruned / total_params
+        print(f"L2 structured pruning resulted in {sparsity:.2f}% sparsity in target layers")
+
+    return model
+
+
+def calculate_activation_statistics(model, dataset, processor, num_samples=100, device=None):
+    """
+    Calculate activation statistics for feed-forward layers in the model.
+
+    Args:
+        model: The model to analyze
+        dataset: Dataset to use for activation collection
+        processor: Processor for the model
+        num_samples: Number of samples to process
+        device: Device to run on
+
+    Returns:
+        Dictionary of activation statistics by layer
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    # Set up hooks to collect activations
+    activation_stats = {}
+    hooks = []
+
+    def hook_fn(name):
+        def hook(module, input, output):
+            # Store activations for this layer
+            if name not in activation_stats:
+                activation_stats[name] = []
+
+            # Only store norm of activations to save memory
+            activation_norm = output.norm(dim=1).mean().item()
+            activation_stats[name].append(activation_norm)
+
+        return hook
+
+    # Register hooks for feed-forward/MLP modules
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and any(
+            ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]
+        ):
+            # Create a hook for this module
+            hooks.append(module.register_forward_hook(hook_fn(name)))
+
+    # Process a subset of the data
+    model.eval()
+    with torch.no_grad():
+        for i, example in enumerate(dataset):
+            if i >= num_samples:
+                break
+
+            # Process a single example
+            input_features = processor(
+                example["audio"]["array"],
+                sampling_rate=example["audio"]["sampling_rate"],
+                return_tensors="pt",
+            ).input_features.to(device)
+
+            # Forward pass to trigger hooks
+            model(input_features)
+
+    # Remove hooks
+    for hook in hooks:
+        hook.remove()
+
+    # Calculate statistics
+    layer_stats = {}
+    for name, activations in activation_stats.items():
+        layer_idx = -1
+        if "layers." in name:
+            try:
+                layer_str = name.split("layers.")[1].split(".")[0]
+                layer_idx = int(layer_str)
+            except (ValueError, IndexError):
+                pass
+
+        # Store average activation norm
+        if activations:
+            avg_activation = sum(activations) / len(activations)
+            layer_stats[name] = {"activation_norm": avg_activation, "layer_idx": layer_idx}
+
+    return layer_stats
+
+
+def prune_mlps_by_activation(model, activation_stats, prune_fraction=0.3):
+    """
+    Prune MLP/feed-forward layers based on activation statistics.
+    Layers with lower activation norms are pruned more aggressively.
+
+    Args:
+        model: The model to prune
+        activation_stats: Dictionary of activation statistics by layer
+        prune_fraction: Base fraction to prune
+
+    Returns:
+        Pruned model
+    """
+    print("Pruning MLPs based on activation sensitivity")
+
+    # Sort layers by activation norm
+    sorted_layers = sorted(
+        [(name, stats["activation_norm"]) for name, stats in activation_stats.items()],
+        key=lambda x: x[1],  # Sort by activation norm
+    )
+
+    # Apply different pruning amounts based on activation importance
+    for i, (name, activation_norm) in enumerate(sorted_layers):
+        # Fraction depends on position in sorted list - lower activations get pruned more
+        position_fraction = i / max(1, len(sorted_layers) - 1)  # 0 to 1
+
+        # Scale pruning amount: less important layers (low activation) get pruned more
+        # Most important layer gets prune_fraction/2, least important gets prune_fraction*1.5
+        scale = 1.5 - position_fraction
+        layer_prune_amount = prune_fraction * scale
+
+        # Cap pruning amount at 0.8 (80%)
+        layer_prune_amount = min(0.8, layer_prune_amount)
+
+        # Find the specific module in the model
+        for module_name, module in model.named_modules():
+            if name == module_name and isinstance(module, torch.nn.Linear):
+                print(
+                    f"  Pruning {name} with amount={layer_prune_amount:.2f} (activation norm: {activation_norm:.4f})"
+                )
+                try:
+                    prune.l1_unstructured(module, "weight", amount=layer_prune_amount)
+                except Exception as e:
+                    print(f"  Error pruning {name}: {e}")
+
+    # Make pruning permanent
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            try:
+                prune.remove(module, "weight")
+            except:
+                pass
+
+    return model
+
+
+def compute_weight_gradients(model, dataset, processor, loss_fn=None, num_samples=50, device=None):
+    """
+    Compute weight gradients to identify important weights for gradient-based pruning.
+
+    Args:
+        model: The model to analyze
+        dataset: Dataset for computing gradients
+        processor: Processor for the model
+        loss_fn: Loss function (defaults to CrossEntropyLoss)
+        num_samples: Number of samples to use
+        device: Device to use
+
+    Returns:
+        Dictionary mapping parameter names to gradient magnitudes
+    """
+    if device is None:
+        device = next(model.parameters()).device
+
+    if loss_fn is None:
+        loss_fn = torch.nn.CrossEntropyLoss()
+
+    # Enable gradient computation
+    for param in model.parameters():
+        param.requires_grad = True
+
+    # Store gradients
+    gradient_dict = {}
+
+    # Process samples to compute gradients
+    model.train()  # Set to train mode to calculate gradients
+
+    for i, example in enumerate(dataset):
+        if i >= num_samples:
+            break
+
+        # Process example and create targets
+        input_features = processor(
+            example["audio"]["array"],
+            sampling_rate=example["audio"]["sampling_rate"],
+            return_tensors="pt",
+        ).input_features.to(device)
+
+        # Forward pass
+        outputs = model(input_features)
+
+        # For simplicity, we'll use a dummy loss that encourages smaller logits
+        # This is just to get gradient signal flowing through the model
+        loss = torch.mean(torch.abs(outputs.logits))
+
+        # Backward pass to compute gradients
+        loss.backward()
+
+        # Break after a few samples to conserve memory
+        if i >= 5:
+            break
+
+    # Store gradient magnitudes
+    for name, param in model.named_parameters():
+        if param.grad is not None and "weight" in name:
+            gradient_dict[name] = param.grad.abs().mean().item()
+
+    # Zero all gradients
+    model.zero_grad()
+
+    # Set model back to eval mode
+    model.eval()
+
+    # Set requires_grad to False to conserve memory
+    for param in model.parameters():
+        param.requires_grad = False
+
+    return gradient_dict
+
+
+def prune_weights_by_gradient_importance(model, gradient_dict, sparsity=0.3):
+    """
+    Prune weights based on a combination of weight magnitude and gradient information.
+    Weights with small magnitude and small gradients are pruned first.
+
+    Args:
+        model: The model to prune
+        gradient_dict: Dictionary of gradient magnitudes by parameter name
+        sparsity: Overall sparsity target
+
+    Returns:
+        Pruned model
+    """
+    print(f"Pruning weights using gradient importance (sparsity={sparsity})")
+
+    # Compute importance scores and collect all weights
+    all_weights = []
+    importance_by_param = {}
+
+    for name, param in model.named_parameters():
+        if "weight" in name and param.dim() > 1:
+            # Get gradient magnitude for this parameter
+            grad_magnitude = gradient_dict.get(name, 0.0)
+
+            # Compute importance: weight_magnitude * gradient_magnitude
+            # Small weights with small gradients get pruned first
+            weight_abs = param.abs()
+            importance = weight_abs * (grad_magnitude + 1e-10)  # Add epsilon to avoid zeros
+
+            # Store flattened weights and importance scores
+            param_flat = param.flatten()
+            importance_flat = importance.flatten()
+
+            # Store for global pruning
+            all_weights.append(param_flat)
+            importance_by_param[name] = (param, importance_flat)
+
+    # Concatenate all weights and importance scores
+    all_weights_concat = torch.cat(all_weights)
+
+    # Determine number of weights to prune
+    total_weights = all_weights_concat.numel()
+    num_to_prune = int(sparsity * total_weights)
+
+    print(f"  Total weights: {total_weights}, will prune {num_to_prune} weights")
+
+    # Create masks for all parameters based on global importance threshold
+    zero_count = 0
+    for name, (param, importance) in importance_by_param.items():
+        # Create a mask: True for weights to keep, False for weights to prune
+        mask = torch.ones_like(param, dtype=torch.bool)
+
+        # Determine importance threshold to achieve desired sparsity
+        flat_importance = importance.flatten()
+        if num_to_prune > 0 and flat_importance.numel() > 0:
+            # Sort importance scores
+            sorted_importance, _ = torch.sort(flat_importance)
+            # Get threshold at the desired sparsity level
+            if num_to_prune < sorted_importance.numel():
+                threshold = sorted_importance[num_to_prune]
+                mask_flat = flat_importance > threshold
+                mask = mask_flat.reshape(param.shape)
+
+                # Count zeros to be introduced by this mask
+                zeros_in_mask = (~mask).sum().item()
+                zero_count += zeros_in_mask
+
+        # Apply mask
+        with torch.no_grad():
+            param.mul_(mask)
+
+    # Report achieved sparsity
+    actual_sparsity = 100.0 * zero_count / total_weights
+    print(f"  Achieved sparsity: {actual_sparsity:.2f}%")
+
+    return model
+
+
 def calculate_pruned_dense_size(model, pruning_threshold=0.0):
     """
     Calculate the theoretical size of a dense model with pruned weights removed.
@@ -1627,7 +1972,7 @@ def main():
     pruning_configs = {
         # Baseline (no pruning)
         "baseline": {"pruning_config": None},
-        # Basic L1 Unstructured Pruning
+        # ===== L1 Unstructured Pruning =====
         # Encoder-only pruning
         "encoder_only_30": {
             "pruning_config": {
@@ -1671,31 +2016,67 @@ def main():
                 "make_permanent": True,
             }
         },
-        # Layerwise Pruning
-        # Early vs Late Layer Pruning
-        "early_layers_40": {
+        # ===== L2 Structured Pruning =====
+        "encoder_l2_30": {
             "pruning_config": {
-                "method": "custom",  # Will handle specially
+                "method": "ln_structured",
+                "amount": 0.3,
+                "target_submodules": ["encoder"],
                 "make_permanent": True,
-                "description": "40% pruning on early layers (0-2)",
             }
         },
-        "late_layers_40": {
+        "decoder_l2_30": {
             "pruning_config": {
-                "method": "custom",  # Will handle specially
+                "method": "ln_structured",
+                "amount": 0.3,
+                "target_submodules": ["decoder"],
                 "make_permanent": True,
-                "description": "40% pruning on late layers (6+)",
+            }
+        },
+        # ===== Layerwise Pruning =====
+        # Early vs Late Layer Pruning with L1
+        "early_layers_l1_40": {
+            "pruning_config": {
+                "method": "custom",
+                "make_permanent": True,
+                "description": "40% L1 pruning on early layers (0-2)",
+            }
+        },
+        "late_layers_l1_40": {
+            "pruning_config": {
+                "method": "custom",
+                "make_permanent": True,
+                "description": "40% L1 pruning on late layers (6+)",
+            }
+        },
+        # Early vs Late Layer Pruning with L2
+        "early_layers_l2_40": {
+            "pruning_config": {
+                "method": "custom_l2",
+                "make_permanent": True,
+                "description": "40% L2 structured pruning on early layers (0-2)",
+                "target_layers": [0, 1, 2],
+                "amount": 0.4,
+            }
+        },
+        "late_layers_l2_40": {
+            "pruning_config": {
+                "method": "custom_l2",
+                "make_permanent": True,
+                "description": "40% L2 structured pruning on late layers (6+)",
+                "target_layers": [6, 7, 8, 9, 10, 11],
+                "amount": 0.4,
             }
         },
         # Progressive layerwise pruning
         "progressive_layerwise": {
             "pruning_config": {
-                "method": "custom",  # Will handle specially
+                "method": "custom",
                 "make_permanent": True,
                 "description": "Progressive pruning: 10% early, 20% mid, 40% late layers",
             }
         },
-        # Component-Specific Pruning
+        # ===== Component-Specific Pruning =====
         # Attention and Feed-Forward components
         "attention_only_40": {
             "pruning_config": {
@@ -1722,7 +2103,7 @@ def main():
                 "pruning_method": "l1_unstructured",
             }
         },
-        # Structural Pruning Methods
+        # ===== Structural Pruning Methods =====
         # Attention Head Pruning
         "head_pruning_40": {
             "pruning_config": {
@@ -1740,6 +2121,15 @@ def main():
                 "head_removal_percentage": 1.0,  # Complete removal
             }
         },
+        "head_removal_late": {
+            "pruning_config": {
+                "method": "custom_head_removal",
+                "make_permanent": True,
+                "description": "Remove heads completely from late layers (6+)",
+                "layers_for_head_removal": [6, 7, 8],
+                "head_removal_percentage": 1.0,  # Complete removal
+            }
+        },
         # Layer Dropping
         "layer_dropping": {
             "pruning_config": {
@@ -1751,22 +2141,48 @@ def main():
             }
         },
         # MLP/Feed-Forward Removal
-        "mlp_removal": {
+        "mlp_removal_early": {
             "pruning_config": {
                 "method": "custom_mlp_removal",
                 "make_permanent": True,
-                "description": "Remove entire MLP blocks from specific layers",
-                "layers_for_mlp_removal": [0, 3, 6],  # Remove MLPs from these layers
+                "description": "Remove entire MLP blocks from early layers",
+                "layers_for_mlp_removal": [0, 1, 2],  # Remove MLPs from early layers
             }
         },
-        # Alternative Pruning Methods
-        # Global magnitude pruning
+        "mlp_removal_late": {
+            "pruning_config": {
+                "method": "custom_mlp_removal",
+                "make_permanent": True,
+                "description": "Remove entire MLP blocks from late layers",
+                "layers_for_mlp_removal": [6, 7, 8],  # Remove MLPs from late layers
+            }
+        },
+        # ===== Advanced Pruning Methods =====
+        # Activation-based pruning
+        "mlp_activation_sensitivity": {
+            "pruning_config": {
+                "method": "activation_sensitivity",
+                "make_permanent": True,
+                "description": "Prune MLPs based on activation statistics",
+                "base_prune_fraction": 0.3,
+            }
+        },
+        # Magnitude pruning
         "magnitude_pruning_30": {
             "pruning_config": {
                 "method": "custom_magnitude",
                 "make_permanent": True,
                 "description": "30% global magnitude pruning",
                 "threshold_percentage": 0.3,
+            }
+        },
+        # Gradient-based pruning
+        "gradient_based_30": {
+            "pruning_config": {
+                "method": "gradient_based",
+                "make_permanent": True,
+                "description": "30% pruning based on gradient importance",
+                "sparsity": 0.3,
             }
         },
         # Mixed strategy pruning
@@ -1813,14 +2229,14 @@ def main():
         clear_gpu_memory()
 
         try:
-            if model_name == "early_layers_40":
+            if model_name == "early_layers_l1_40":
                 # Load model
                 model = WhisperForConditionalGeneration.from_pretrained(
                     original_model_name, device_map=None
                 )
 
                 # Apply pruning specifically to early layers
-                print("Applying 40% pruning to early layers (0-2)...")
+                print("Applying 40% L1 pruning to early layers (0-2)...")
                 for name, module in model.named_modules():
                     if isinstance(module, torch.nn.Linear):
                         # Check if it's an early layer
@@ -1833,9 +2249,9 @@ def main():
                                 pass
 
                         if layer_idx >= 0 and layer_idx < 3:
-                            # Apply heavy pruning to early layers
+                            # Apply L1 pruning to early layers
                             prune.l1_unstructured(module, "weight", amount=0.4)
-                            print(f"  Pruned early layer: {name}")
+                            print(f"  Pruned early layer with L1: {name}")
 
                 # Make pruning permanent
                 for name, module in model.named_modules():
@@ -1849,14 +2265,14 @@ def main():
                 model = model.to(device)
                 model.config.forced_decoder_ids = None
 
-            elif model_name == "late_layers_40":
+            elif model_name == "late_layers_l1_40":
                 # Load model
                 model = WhisperForConditionalGeneration.from_pretrained(
                     original_model_name, device_map=None
                 )
 
                 # Apply pruning specifically to late layers
-                print("Applying 40% pruning to late layers (6+)...")
+                print("Applying 40% L1 pruning to late layers (6+)...")
                 for name, module in model.named_modules():
                     if isinstance(module, torch.nn.Linear):
                         # Check if it's a late layer
@@ -1869,9 +2285,9 @@ def main():
                                 pass
 
                         if layer_idx >= 6:
-                            # Apply heavy pruning to late layers
+                            # Apply L1 pruning to late layers
                             prune.l1_unstructured(module, "weight", amount=0.4)
-                            print(f"  Pruned late layer: {name}")
+                            print(f"  Pruned late layer with L1: {name}")
 
                 # Make pruning permanent
                 for name, module in model.named_modules():
@@ -1880,6 +2296,40 @@ def main():
                             prune.remove(module, "weight")
                         except:
                             pass
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "early_layers_l2_40":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Get configuration
+                target_layers = pruning_configs[model_name]["pruning_config"]["target_layers"]
+                amount = pruning_configs[model_name]["pruning_config"]["amount"]
+
+                # Apply L2 structured pruning to early layers
+                model = apply_l2_structured_pruning_to_layers(model, target_layers, amount)
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "late_layers_l2_40":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Get configuration
+                target_layers = pruning_configs[model_name]["pruning_config"]["target_layers"]
+                amount = pruning_configs[model_name]["pruning_config"]["amount"]
+
+                # Apply L2 structured pruning to late layers
+                model = apply_l2_structured_pruning_to_layers(model, target_layers, amount)
 
                 # Move to device
                 model = model.to(device)
@@ -1930,7 +2380,7 @@ def main():
                 model = model.to(device)
                 model.config.forced_decoder_ids = None
 
-            elif model_name == "head_removal_early":
+            elif model_name == "head_removal_late":
                 # Load model
                 model = WhisperForConditionalGeneration.from_pretrained(
                     original_model_name, device_map=None
@@ -1969,7 +2419,7 @@ def main():
                 model = model.to(device)
                 model.config.forced_decoder_ids = None
 
-            elif model_name == "mlp_removal":
+            elif model_name == "mlp_removal_early":
                 # Load model
                 model = WhisperForConditionalGeneration.from_pretrained(
                     original_model_name, device_map=None
@@ -1981,7 +2431,7 @@ def main():
                 ]
 
                 print(
-                    f"Removing MLP/feed-forward blocks completely from layers: {layers_for_mlp_removal}"
+                    f"Removing MLP/feed-forward blocks completely from early layers: {layers_for_mlp_removal}"
                 )
 
                 # Find MLP modules in the target layers
@@ -2000,11 +2450,116 @@ def main():
                         if any(ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]):
                             # Zero out weights for these feed-forward components
                             if hasattr(module, "weight"):
-                                print(f"  Removing MLP in layer {layer_idx}: {name}")
+                                print(f"  Removing MLP in early layer {layer_idx}: {name}")
                                 module.weight.data.zero_()
                                 # Also zero bias if it exists
                                 if hasattr(module, "bias") and module.bias is not None:
                                     module.bias.data.zero_()
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "mlp_removal_late":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Get the pruning config
+                layers_for_mlp_removal = pruning_configs[model_name]["pruning_config"][
+                    "layers_for_mlp_removal"
+                ]
+
+                print(
+                    f"Removing MLP/feed-forward blocks completely from late layers: {layers_for_mlp_removal}"
+                )
+
+                # Find MLP modules in the target layers
+                for name, module in model.named_modules():
+                    layer_idx = -1
+                    if "layers." in name:
+                        try:
+                            layer_str = name.split("layers.")[1].split(".")[0]
+                            layer_idx = int(layer_str)
+                        except (ValueError, IndexError):
+                            pass
+
+                    # Check if this layer should have MLP removed
+                    if layer_idx in layers_for_mlp_removal:
+                        # Find feed-forward/MLP components
+                        if any(ff_part in name for ff_part in ["feed_forward", "fc", "mlp"]):
+                            # Zero out weights for these feed-forward components
+                            if hasattr(module, "weight"):
+                                print(f"  Removing MLP in late layer {layer_idx}: {name}")
+                                module.weight.data.zero_()
+                                # Also zero bias if it exists
+                                if hasattr(module, "bias") and module.bias is not None:
+                                    module.bias.data.zero_()
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "mlp_activation_sensitivity":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Get the pruning config
+                base_prune_fraction = pruning_configs[model_name]["pruning_config"][
+                    "base_prune_fraction"
+                ]
+
+                print(
+                    f"Pruning MLPs based on activation sensitivity (base_prune_fraction={base_prune_fraction})"
+                )
+
+                # Calculate activation statistics
+                print("Collecting activation statistics from a sample of the dataset...")
+
+                # Create a small sample of the dataset to collect activations
+                dataset_sample = dataset_clean.select(range(min(50, len(dataset_clean))))
+                activation_stats = calculate_activation_statistics(
+                    model=model, dataset=dataset_sample, processor=processor, num_samples=50
+                )
+
+                # Prune MLPs based on activation sensitivity
+                model = prune_mlps_by_activation(
+                    model=model,
+                    activation_stats=activation_stats,
+                    prune_fraction=base_prune_fraction,
+                )
+
+                # Move to device
+                model = model.to(device)
+                model.config.forced_decoder_ids = None
+
+            elif model_name == "gradient_based_30":
+                # Load model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    original_model_name, device_map=None
+                )
+
+                # Get the pruning config
+                sparsity = pruning_configs[model_name]["pruning_config"]["sparsity"]
+
+                print(f"Pruning weights based on gradient importance (sparsity={sparsity})")
+
+                # Create a small sample of the dataset to compute gradients
+                dataset_sample = dataset_clean.select(range(min(20, len(dataset_clean))))
+
+                # Compute gradients
+                print("Computing weight gradients...")
+                gradient_dict = compute_weight_gradients(
+                    model=model, dataset=dataset_sample, processor=processor, num_samples=10
+                )
+
+                # Prune weights using gradient importance
+                model = prune_weights_by_gradient_importance(
+                    model=model, gradient_dict=gradient_dict, sparsity=sparsity
+                )
 
                 # Move to device
                 model = model.to(device)
@@ -2257,22 +2812,34 @@ def main():
 
     # Group results by pruning approach
     config_groups = {
-        "Basic L1 Unstructured Pruning": [
+        "L1 Unstructured Pruning": [
             "encoder_only_30",
             "encoder_only_40",
             "decoder_only_30",
             "decoder_only_40",
             "combined_encoder_decoder_30",
         ],
-        "Layerwise Pruning": ["early_layers_40", "late_layers_40", "progressive_layerwise"],
+        "L2 Structured Pruning": [
+            "encoder_l2_30",
+            "decoder_l2_30",
+            "early_layers_l2_40",
+            "late_layers_l2_40",
+        ],
+        "Layerwise Pruning": ["early_layers_l1_40", "late_layers_l1_40", "progressive_layerwise"],
         "Component-Specific Pruning": ["attention_only_40", "ffn_only_40", "attention_vs_ffn"],
-        "Structural Pruning Methods": [
+        "Head & MLP Removal": [
             "head_pruning_40",
             "head_removal_early",
-            "layer_dropping",
-            "mlp_removal",
+            "head_removal_late",
+            "mlp_removal_early",
+            "mlp_removal_late",
         ],
-        "Alternative Pruning Methods": ["magnitude_pruning_30", "mixed_strategy"],
+        "Advanced Pruning Methods": [
+            "mlp_activation_sensitivity",
+            "magnitude_pruning_30",
+            "gradient_based_30",
+            "mixed_strategy",
+        ],
     }
 
     for group_name, configs in config_groups.items():
