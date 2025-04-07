@@ -4,7 +4,6 @@ import json
 import os
 import time
 from collections import deque
-from datetime import datetime
 
 import datasets
 import matplotlib.pyplot as plt
@@ -21,7 +20,7 @@ sns.set(style="whitegrid")
 
 # Create results directory
 RESULTS_DIR = "pruning/whisper_pruning_results"
-L1_PRUNING_DIR = os.path.join(RESULTS_DIR, "l1_pruning")
+L1_PRUNING_DIR = os.path.join(RESULTS_DIR, "l1_encoder_pruning")  # Changed to indicate encoder-only
 PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
 MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
 
@@ -185,7 +184,7 @@ class WhisperMemoryTracker:
         self.peak_gpu_memory = 0
         self.peak_cpu_percent = 0
         self.peak_ram_gb = 0
-        self.memory_measurements = deque(maxlen=500)  # Store last 500 measurements
+        self.memory_measurements = deque(maxlen=10)  # Reduced size, only for summary
         self.start_time = time.time()
         self.process = psutil.Process()
         self.device_type = "cpu"
@@ -300,26 +299,12 @@ class WhisperMemoryTracker:
         return summary
 
     def save_metrics(self):
-        """Save memory metrics to a JSON file."""
-        metrics_path = os.path.join(self.save_path, f"{self.model_name}_memory_metrics.json")
+        """Save only summary memory metrics to a JSON file."""
+        metrics_path = os.path.join(self.save_path, f"{self.model_name}_memory_summary.json")
         summary = self.get_memory_summary()
 
-        # Convert deque to list for JSON serialization
-        measurements_list = []
-        for m in self.memory_measurements:
-            # Create a copy of each measurement to avoid modifying the original
-            measurement_copy = m.copy() if isinstance(m, dict) else m
-            # Convert any non-serializable types
-            if isinstance(measurement_copy, dict):
-                # Convert timestamps to strings if they're datetime objects
-                if "timestamp" in measurement_copy and isinstance(
-                    measurement_copy["timestamp"], datetime
-                ):
-                    measurement_copy["timestamp"] = measurement_copy["timestamp"].isoformat()
-            measurements_list.append(measurement_copy)
-
-        # Create the output dictionary with serializable data
-        output_data = {"summary": summary, "detailed_measurements": measurements_list}
+        # Create the output dictionary with only summary data
+        output_data = {"summary": summary}
 
         try:
             with open(metrics_path, "w") as f:
@@ -337,7 +322,6 @@ class WhisperMemoryTracker:
                         "current_ram_gb": self.process.memory_info().rss / (1024**3),
                     },
                 },
-                "error": "Full data couldn't be serialized to JSON",
             }
             with open(metrics_path, "w") as f:
                 json.dump(simplified_output, f, indent=2)
@@ -478,7 +462,9 @@ def save_sparse_model(model, output_path):
         return 0
 
 
-def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=False):
+def apply_l1_pruning(
+    model, amount=0.3, target_modules=None, make_permanent=False, encoder_only=False
+):
     """
     Apply L1 unstructured pruning to a Whisper model.
 
@@ -487,6 +473,7 @@ def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=Fals
         amount: Amount of weights to prune (0.3 = 30%)
         target_modules: List of module types to prune (None = all Linear layers)
         make_permanent: Whether to make pruning permanent
+        encoder_only: Whether to only prune encoder modules (ignoring decoder)
 
     Returns:
         Pruned model
@@ -497,10 +484,18 @@ def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=Fals
 
     # Get parameters to prune based on target modules
     params_to_prune = []
+    encoder_modules = 0
+    total_modules = 0
+
     for name, module in model.named_modules():
         # Check if module is of target type
         if any(isinstance(module, m) for m in target_modules):
-            params_to_prune.append((module, "weight"))
+            total_modules += 1
+            # Only include encoder modules if encoder_only is True
+            if not encoder_only or "encoder" in name:
+                params_to_prune.append((module, "weight"))
+                if "encoder" in name:
+                    encoder_modules += 1
 
     if not params_to_prune:
         print("Warning: No parameters found to prune! Check your target modules.")
@@ -510,47 +505,82 @@ def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=Fals
         f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
     )
 
+    if encoder_only:
+        print(
+            f"Note: Only pruning encoder modules ({encoder_modules} encoder modules out of {total_modules} total modules)"
+        )
+
     # Apply L1 unstructured pruning
-    prune.global_unstructured(params_to_prune, pruning_method=prune.L1Unstructured, amount=amount)
+    success_count = 0
+    try:
+        prune.global_unstructured(
+            params_to_prune, pruning_method=prune.L1Unstructured, amount=amount
+        )
+        success_count = len(params_to_prune)
+    except Exception as e:
+        print(f"Error during global unstructured pruning: {e}")
+
+        # Try pruning modules individually if global pruning fails
+        for i, (module, param_name) in enumerate(params_to_prune):
+            try:
+                prune.l1_unstructured(module, param_name, amount=amount)
+                success_count += 1
+            except Exception as e2:
+                print(f"Error pruning module {i}: {e2}")
+
+    print(f"Successfully applied pruning to {success_count}/{len(params_to_prune)} modules")
 
     # Make pruning permanent if requested
     if make_permanent:
         print("Making pruning permanent...")
+        permanent_count = 0
         for module, param_name in params_to_prune:
             try:
-                prune.remove(module, param_name)
+                # Only make permanent if the module has a weight_mask attribute
+                if hasattr(module, f"{param_name}_mask"):
+                    prune.remove(module, param_name)
+                    permanent_count += 1
             except Exception as e:
                 print(f"Could not make pruning permanent for {module}: {e}")
+        print(f"Made pruning permanent for {permanent_count}/{len(params_to_prune)} modules")
 
     return model
 
 
-def calculate_sparsity(model):
+def calculate_sparsity(model, component=None):
     """
-    Calculate the sparsity percentage in the model.
+    Calculate the sparsity percentage and parameter counts in the model.
 
     Args:
         model: The PyTorch model
+        component: Optional component to focus on ('encoder', 'decoder', or None for whole model)
 
     Returns:
-        float: Percentage of zero weights in the model
+        tuple: (sparsity percentage, total parameters, non-zero parameters)
     """
     total_params = 0
     zero_params = 0
 
     for name, param in model.named_parameters():
+        # Filter by component if specified
+        if component and component not in name:
+            continue
+
         if "weight" in name:  # Only consider weight parameters
             total_params += param.numel()
             zero_params += torch.sum(param == 0).item()
 
     if total_params == 0:
-        return 0.0
+        return 0.0, 0, 0
 
     sparsity = 100.0 * zero_params / total_params
-    return sparsity
+    non_zero_params = total_params - zero_params
+    return sparsity, total_params, non_zero_params
 
 
-def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=True):
+def load_whisper_model(
+    model_name, device, pruning_amount=None, make_permanent=True, encoder_only=False
+):
     """
     Load Whisper model and optionally apply pruning.
 
@@ -559,6 +589,7 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
         device: Device to load the model to
         pruning_amount: Amount to prune (0.0 to 0.99) or None for no pruning
         make_permanent: Whether to make pruning permanent
+        encoder_only: Whether to only prune the encoder (ignoring decoder)
 
     Returns:
         WhisperForConditionalGeneration model
@@ -570,11 +601,25 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
             print(f"Applying L1 unstructured pruning with amount={pruning_amount}")
-            model = apply_l1_pruning(model, amount=pruning_amount, make_permanent=make_permanent)
+            if encoder_only:
+                print("Note: Only pruning encoder modules")
+            model = apply_l1_pruning(
+                model,
+                amount=pruning_amount,
+                make_permanent=make_permanent,
+                encoder_only=encoder_only,
+            )
 
             # Calculate and print sparsity
-            sparsity = calculate_sparsity(model)
-            print(f"Model sparsity after pruning: {sparsity:.2f}%")
+            overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
+            encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
+            decoder_sparsity, decoder_total, decoder_nonzero = calculate_sparsity(model, "decoder")
+
+            print(f"Overall model sparsity: {overall_sparsity:.2f}%")
+            print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
+            print(f"Decoder sparsity: {decoder_sparsity:.2f}%")
+            print(f"Total parameters: {total_params:,}")
+            print(f"Non-zero parameters: {non_zero_params:,}")
 
         # Move model to device
         model = model.to(device)
@@ -753,7 +798,8 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
         result = dataset.map(process_batch, batched=True, batch_size=batch_size)
     except Exception as e:
         print(f"Error during dataset mapping: {e}")
-        return {"error": str(e)}, {"error": str(e)}
+        return {"error": str(e)}, None
+
     end = time.time()
 
     # Calculate overall RTF from the accumulated totals
@@ -813,12 +859,13 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
     except Exception as e:
         print(f"Error recording memory metrics: {e}")
 
-    print(f"\n{len(result)} sentences evaluated in {end - start:.2f} s.")
+    print(f"{len(result)} sentences evaluated in {end - start:.2f} s.")
     print(f"Average batch latency: {scores['avg_latency']:.4f} s")
     print(f"Total processing time: {total_processing_time:.2f} s")
     print(f"Total audio duration: {total_audio_duration:.2f} s")
 
-    return scores, {"references": result["reference"], "predictions": result["prediction"]}
+    # FIX: Return only two values to match the unpacking in the main function
+    return scores, result
 
 
 def load_librispeech(num_samples=None, split="test.clean"):
@@ -850,18 +897,14 @@ def load_librispeech(num_samples=None, split="test.clean"):
 
 
 def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
-    try:
-        buffer = io.BytesIO()
-        torch.save(
-            model.state_dict(), buffer, _use_new_zipfile_serialization=True
-        )  # Use new serialization
-        return buffer.getbuffer().nbytes / (1024**2)
-    except Exception as e:
-        print(f"Error measuring model size: {e}")
-        return 0.0
+    buffer = io.BytesIO()
+    torch.save(
+        model.state_dict(), buffer, _use_new_zipfile_serialization=True
+    )  # Use new serialization
+    return buffer.getbuffer().nbytes / (1024**2)
 
 
-def create_plots(results, metric_names, plot_dir):
+def create_plots(results, metric_names, plot_dir, encoder_only=True):
     """
     Create plots of metrics vs pruning percentage.
 
@@ -869,6 +912,7 @@ def create_plots(results, metric_names, plot_dir):
         results: Dictionary of results
         metric_names: List of metric names to plot
         plot_dir: Directory to save plots
+        encoder_only: Whether this is encoder-only pruning (True) or whole model pruning (False)
     """
     print("\nGenerating plots...")
 
@@ -876,253 +920,288 @@ def create_plots(results, metric_names, plot_dir):
     pruning_percentages = []
     metrics_by_split = {"clean": {}, "other": {}}
 
-    # First, identify all unique pruning percentages
-    for model_name, model_results in results.items():
-        try:
-            if "baseline" in model_name:
-                percent = 0
-            else:
-                # Extract percentage from model name (e.g., "l1_10")
-                percent = int(model_name.split("_")[1])
-
-            if percent not in pruning_percentages:
-                pruning_percentages.append(percent)
-        except (IndexError, ValueError) as e:
-            print(f"Warning: Could not extract pruning percentage from {model_name}: {e}")
-            continue
-
-    # Sort pruning percentages
-    pruning_percentages.sort()
-    print(f"Found pruning percentages: {pruning_percentages}")
-
-    # Initialize metric containers
+    # Initialize metrics for each split
     for split in ["clean", "other"]:
         for metric in metric_names:
             metrics_by_split[split][metric] = []
 
-    # Organize metrics by split and percentage
+    # Process results and gather data for plotting
     for model_name, model_results in results.items():
-        try:
-            if "baseline" in model_name:
-                percent = 0
-            else:
-                percent = int(model_name.split("_")[1])
-
-            split = "clean" if "clean" in model_name else "other"
-
-            # Check for metrics
-            if "metrics" not in model_results and "error" not in model_results:
-                print(f"Warning: No metrics found for {model_name}")
+        if "baseline" in model_name:
+            percent = 0
+        else:
+            # Extract percentage from model name
+            try:
+                if encoder_only:
+                    # For encoder-only models (format: "l1_encoder_XX_clean" or "l1_encoder_XX_other")
+                    percent = int(model_name.split("_")[-2])
+                else:
+                    # For whole model pruning (format: "l1_XX_clean" or "l1_XX_other")
+                    percent = int(model_name.split("_")[1])
+            except (IndexError, ValueError):
+                print(f"Skipping invalid model name: {model_name}")
                 continue
 
-            # Check if metrics contain error
-            if "error" in model_results:
-                print(f"Warning: Error in results for {model_name}: {model_results['error']}")
-                continue
-
-            if "metrics" in model_results and "error" in model_results["metrics"]:
-                print(
-                    f"Warning: Error in metrics for {model_name}: {model_results['metrics']['error']}"
-                )
-                continue
-
-            # Extract metrics
-            for metric in metric_names:
-                if "metrics" in model_results and metric in model_results["metrics"]:
-                    if (
-                        isinstance(model_results["metrics"][metric], (int, float))
-                        and model_results["metrics"][metric] >= 0
-                    ):
-                        metrics_by_split[split][metric].append(
-                            (percent, model_results["metrics"][metric])
-                        )
-                elif metric in model_results:
-                    # Some metrics might be at the top level
-                    if (
-                        isinstance(model_results[metric], (int, float))
-                        and model_results[metric] >= 0
-                    ):
-                        metrics_by_split[split][metric].append((percent, model_results[metric]))
-        except Exception as e:
-            print(f"Warning: Error processing results for {model_name}: {e}")
+        # Determine which split this model belongs to
+        if "_clean" in model_name:
+            split = "clean"
+        elif "_other" in model_name:
+            split = "other"
+        else:
+            print(f"Cannot determine split for model: {model_name}, skipping")
             continue
+
+        # Add percent to pruning_percentages list if not already there
+        if percent not in pruning_percentages:
+            pruning_percentages.append(percent)
+
+        # Check if metrics exist in the model results
+        if "metrics" not in model_results:
+            print(f"No metrics found for {model_name}, skipping")
+            continue
+
+        # Add data points for each metric
+        for metric in metric_names:
+            if metric in model_results["metrics"]:
+                metrics_by_split[split][metric].append((percent, model_results["metrics"][metric]))
+            else:
+                print(f"Metric {metric} not found for {model_name}")
+
+    # Sort pruning percentages
+    pruning_percentages.sort()
+
+    # Title prefix for plots
+    pruning_type = "Encoder-Only" if encoder_only else "Whole Model"
 
     # Create individual plots for each metric
     for metric in metric_names:
-        try:
-            plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(10, 6))
+        legend_entries = []
 
-            # Plot for both splits
-            for split in ["clean", "other"]:
-                if not metrics_by_split[split].get(metric, []):
-                    print(f"No data for {metric} on {split} split, skipping")
-                    continue
+        # Plot for both splits
+        for split in ["clean", "other"]:
+            # Sort data points by pruning percentage
+            data_points = sorted(metrics_by_split[split][metric])
 
-                # Sort data points by pruning percentage
-                data_points = sorted(metrics_by_split[split][metric])
-                if not data_points:
-                    print(f"Warning: No data points for {metric} on {split} split")
-                    continue
-
-                x = [p for p, _ in data_points]
-                y = [v for _, v in data_points]
-
-                plt.plot(x, y, marker="o", label=f"{split} split")
-
-            # Add labels and title
-            plt.xlabel("Pruning Percentage (%)")
-            plt.ylabel(metric)
-            plt.title(f"{metric} vs L1 Unstructured Pruning Percentage")
-            plt.grid(True)
-
-            # Only add legend if we have plotted something
-            if plt.gca().get_legend_handles_labels()[0]:
-                plt.legend()
-            else:
-                print(f"Warning: No data to plot for {metric}")
-                plt.close()
+            # Skip if no data points for this metric and split
+            if not data_points:
+                print(f"No data points for {metric} in {split} split, skipping")
                 continue
 
-            # Save the plot
-            plot_path = os.path.join(plot_dir, f"{metric}_vs_pruning.png")
-            plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-            plt.close()
-            print(f"Saved plot to {plot_path}")
-        except Exception as e:
-            print(f"Error creating plot for {metric}: {e}")
-            plt.close()
+            x = [p for p, _ in data_points]
+            y = [v for _, v in data_points]
 
-    # Create model size plot
-    try:
-        plt.figure(figsize=(10, 6))
+            plt.plot(x, y, marker="o", label=f"{split} split")
+            legend_entries.append(f"{split} split")
 
-        # Extract model sizes
-        dense_sizes = []
-        sparse_sizes = []
-        theoretical_dense_pruned_sizes = []
-
-        for percent in pruning_percentages:
-            # Find the model result with this percentage (prefer clean split)
-            model_name = f"l1_{percent}_clean" if percent > 0 else "baseline_clean"
-            if model_name not in results and percent > 0:
-                model_name = f"l1_{percent}_other"
-            if model_name not in results and percent == 0:
-                model_name = "baseline_other"
-
-            if model_name in results:
-                if (
-                    "model_size_mb" in results[model_name]
-                    and results[model_name]["model_size_mb"] > 0
-                ):
-                    dense_sizes.append((percent, results[model_name]["model_size_mb"]))
-                if (
-                    "sparse_model_size_mb" in results[model_name]
-                    and results[model_name]["sparse_model_size_mb"] > 0
-                ):
-                    sparse_sizes.append((percent, results[model_name]["sparse_model_size_mb"]))
-                if (
-                    "theoretical_dense_pruned_size_mb" in results[model_name]
-                    and results[model_name]["theoretical_dense_pruned_size_mb"] > 0
-                ):
-                    theoretical_dense_pruned_sizes.append(
-                        (percent, results[model_name]["theoretical_dense_pruned_size_mb"])
-                    )
-
-        # Sort by pruning percentage
-        dense_sizes.sort(key=lambda x: x[0])
-        sparse_sizes.sort(key=lambda x: x[0])
-        theoretical_dense_pruned_sizes.sort(key=lambda x: x[0])
-
-        # Plot model sizes
-        if dense_sizes:
-            plt.plot(
-                [p for p, _ in dense_sizes],
-                [s for _, s in dense_sizes],
-                marker="o",
-                label="Dense model size",
-            )
-        if sparse_sizes:
-            plt.plot(
-                [p for p, _ in sparse_sizes],
-                [s for _, s in sparse_sizes],
-                marker="s",
-                label="Sparse model size",
-            )
-        if theoretical_dense_pruned_sizes:
-            plt.plot(
-                [p for p, _ in theoretical_dense_pruned_sizes],
-                [s for _, s in theoretical_dense_pruned_sizes],
-                marker="^",
-                label="Theoretical dense pruned size",
-            )
-
+        # Add labels and title
         plt.xlabel("Pruning Percentage (%)")
-        plt.ylabel("Model Size (MB)")
-        plt.title("Model Size vs L1 Unstructured Pruning Percentage")
+        plt.ylabel(metric)
+        plt.title(f"{metric} vs {pruning_type} L1 Unstructured Pruning Percentage")
         plt.grid(True)
 
-        # Only add legend if we have plotted something
-        if plt.gca().get_legend_handles_labels()[0]:
+        # Only add legend if we have plot lines
+        if legend_entries:
             plt.legend()
-        else:
-            print("Warning: No model size data to plot")
-            plt.close()
-            return
 
         # Save the plot
-        plot_path = os.path.join(plot_dir, "model_size_vs_pruning.png")
+        plot_path = os.path.join(
+            plot_dir, f"{metric}_vs_{pruning_type.lower().replace('-', '_')}_pruning.png"
+        )
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
         print(f"Saved plot to {plot_path}")
-    except Exception as e:
-        print(f"Error creating model size plot: {e}")
-        plt.close()
+
+    # Create model size plot
+    plt.figure(figsize=(10, 6))
+
+    # Extract model sizes
+    dense_sizes = []
+    sparse_sizes = []
+    theoretical_dense_pruned_sizes = []
+
+    for percent in pruning_percentages:
+        # Find the model result with this percentage (prefer clean split)
+        if percent == 0:
+            model_name = "baseline_clean"
+            if model_name not in results:
+                model_name = "baseline_other"
+        else:
+            if encoder_only:
+                model_name = f"l1_encoder_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_encoder_{percent}_other"
+            else:
+                model_name = f"l1_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_{percent}_other"
+
+        if model_name in results:
+            if "model_size_mb" in results[model_name]:
+                dense_sizes.append((percent, results[model_name]["model_size_mb"]))
+            if "sparse_model_size_mb" in results[model_name]:
+                sparse_sizes.append((percent, results[model_name]["sparse_model_size_mb"]))
+            if "theoretical_dense_pruned_size_mb" in results[model_name]:
+                theoretical_dense_pruned_sizes.append(
+                    (percent, results[model_name]["theoretical_dense_pruned_size_mb"])
+                )
+
+    # Sort by pruning percentage
+    dense_sizes.sort(key=lambda x: x[0])
+    sparse_sizes.sort(key=lambda x: x[0])
+    theoretical_dense_pruned_sizes.sort(key=lambda x: x[0])
+
+    # Plot model sizes
+    if dense_sizes:
+        plt.plot(
+            [p for p, _ in dense_sizes],
+            [s for _, s in dense_sizes],
+            marker="o",
+            label="Dense model size",
+        )
+
+    if sparse_sizes:
+        plt.plot(
+            [p for p, _ in sparse_sizes],
+            [s for _, s in sparse_sizes],
+            marker="s",
+            label="Sparse model size",
+        )
+
+    if theoretical_dense_pruned_sizes:
+        plt.plot(
+            [p for p, _ in theoretical_dense_pruned_sizes],
+            [s for _, s in theoretical_dense_pruned_sizes],
+            marker="^",
+            label="Theoretical dense pruned size",
+        )
+
+    plt.xlabel("Pruning Percentage (%)")
+    plt.ylabel("Model Size (MB)")
+    plt.title(f"Model Size vs {pruning_type} L1 Unstructured Pruning Percentage")
+    plt.grid(True)
+    plt.legend()
+
+    # Save the plot
+    plot_path = os.path.join(
+        plot_dir, f"model_size_vs_{pruning_type.lower().replace('-', '_')}_pruning.png"
+    )
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot to {plot_path}")
 
     # Create GFLOPs plot
-    try:
-        plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(10, 6))
 
-        # Extract GFLOPs data
-        gflops_data = []
+    # Extract GFLOPs data
+    gflops_data = []
 
-        for percent in pruning_percentages:
-            # Find the model result with this percentage (prefer clean split)
-            model_name = f"l1_{percent}_clean" if percent > 0 else "baseline_clean"
-            if model_name not in results and percent > 0:
-                model_name = f"l1_{percent}_other"
-            if model_name not in results and percent == 0:
+    for percent in pruning_percentages:
+        # Find the model result with this percentage (prefer clean split)
+        if percent == 0:
+            model_name = "baseline_clean"
+            if model_name not in results:
                 model_name = "baseline_other"
-
-            if model_name in results and "gflops" in results[model_name]:
-                if results[model_name]["gflops"] > 0:
-                    gflops_data.append((percent, results[model_name]["gflops"]))
-
-        # Sort by pruning percentage
-        gflops_data.sort(key=lambda x: x[0])
-
-        # Plot GFLOPs
-        if gflops_data:
-            plt.plot(
-                [p for p, _ in gflops_data], [g for _, g in gflops_data], marker="o", label="GFLOPs"
-            )
-
-            plt.xlabel("Pruning Percentage (%)")
-            plt.ylabel("GFLOPs")
-            plt.title("Computational Complexity (GFLOPs) vs L1 Pruning Percentage")
-            plt.grid(True)
-            plt.legend()
-
-            # Save the plot
-            plot_path = os.path.join(plot_dir, "gflops_vs_pruning.png")
-            plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-            print(f"Saved plot to {plot_path}")
         else:
-            print("Warning: No GFLOPs data to plot")
+            if encoder_only:
+                model_name = f"l1_encoder_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_encoder_{percent}_other"
+            else:
+                model_name = f"l1_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_{percent}_other"
 
-        plt.close()
-    except Exception as e:
-        print(f"Error creating GFLOPs plot: {e}")
-        plt.close()
+        if model_name in results and "gflops" in results[model_name]:
+            gflops_data.append((percent, results[model_name]["gflops"]))
+
+    # Sort by pruning percentage
+    gflops_data.sort(key=lambda x: x[0])
+
+    # Plot GFLOPs
+    if gflops_data:
+        plt.plot(
+            [p for p, _ in gflops_data], [g for _, g in gflops_data], marker="o", label="GFLOPs"
+        )
+
+    plt.xlabel("Pruning Percentage (%)")
+    plt.ylabel("GFLOPs")
+    plt.title(
+        f"Computational Complexity (GFLOPs) vs {pruning_type} L1 Unstructured Pruning Percentage"
+    )
+    plt.grid(True)
+    plt.legend()
+
+    # Save the plot
+    plot_path = os.path.join(
+        plot_dir, f"gflops_vs_{pruning_type.lower().replace('-', '_')}_pruning.png"
+    )
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot to {plot_path}")
+
+    # Create parameter count plot
+    plt.figure(figsize=(10, 6))
+
+    # Extract parameter data
+    total_params = []
+    non_zero_params = []
+
+    for percent in pruning_percentages:
+        # Find the model result with this percentage (prefer clean split)
+        if percent == 0:
+            model_name = "baseline_clean"
+            if model_name not in results:
+                model_name = "baseline_other"
+        else:
+            if encoder_only:
+                model_name = f"l1_encoder_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_encoder_{percent}_other"
+            else:
+                model_name = f"l1_{percent}_clean"
+                if model_name not in results:
+                    model_name = f"l1_{percent}_other"
+
+        if model_name in results:
+            if "total_parameters" in results[model_name]:
+                total_params.append((percent, results[model_name]["total_parameters"]))
+            if "non_zero_parameters" in results[model_name]:
+                non_zero_params.append((percent, results[model_name]["non_zero_parameters"]))
+
+    # Sort by pruning percentage
+    total_params.sort(key=lambda x: x[0])
+    non_zero_params.sort(key=lambda x: x[0])
+
+    # Plot parameter counts
+    if total_params:
+        plt.plot(
+            [p for p, _ in total_params],
+            [t / 1_000_000 for _, t in total_params],
+            marker="o",
+            label="Total parameters",
+        )
+    if non_zero_params:
+        plt.plot(
+            [p for p, _ in non_zero_params],
+            [nz / 1_000_000 for _, nz in non_zero_params],
+            marker="s",
+            label="Non-zero parameters",
+        )
+
+    plt.xlabel("Pruning Percentage (%)")
+    plt.ylabel("Parameters (millions)")
+    plt.title(f"Parameter Count vs {pruning_type} L1 Unstructured Pruning Percentage")
+    plt.grid(True)
+    plt.legend()
+
+    # Save the plot
+    plot_path = os.path.join(
+        plot_dir, f"parameters_vs_{pruning_type.lower().replace('-', '_')}_pruning.png"
+    )
+    plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot to {plot_path}")
 
 
 def main():
@@ -1131,10 +1210,16 @@ def main():
     batch_size = 16  # Match the quantization code batch size
     save_path = L1_PRUNING_DIR
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if (
+        not torch.cuda.is_available()
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    ):
+        device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define the pruning percentages to test (0% to 99%)
-    pruning_percentages = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99]
+    # Define the pruning percentages to test (0% to 50% in 10% increments for encoder-only)
+    pruning_percentages = [0, 10, 20, 30, 40, 50]
 
     # Load processor once - can be shared across models
     processor = WhisperProcessor.from_pretrained(original_model_name)
@@ -1168,8 +1253,9 @@ def main():
     # Add pruning configurations
     for percent in pruning_percentages:
         if percent > 0:  # Skip 0% as it's already in baseline
-            model_configs[f"l1_{percent}"] = {
-                "pruning_amount": percent / 100  # Convert percentage to fraction
+            model_configs[f"l1_encoder_{percent}"] = {
+                "pruning_amount": percent / 100,  # Convert percentage to fraction
+                "encoder_only": True,  # Only prune encoder
             }
 
     # Evaluate each configuration
@@ -1186,73 +1272,37 @@ def main():
             model = load_whisper_model(
                 model_name=original_model_name,
                 device=device,
-                pruning_amount=config["pruning_amount"],
+                pruning_amount=config.get("pruning_amount"),
                 make_permanent=True,
+                encoder_only=config.get("encoder_only", False),
             )
 
-            # Calculate actual sparsity
-            sparsity = calculate_sparsity(model)
-            print(f"Actual model sparsity: {sparsity:.2f}%")
+            # Calculate actual sparsity and parameter counts
+            overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
+            encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
+
+            print(f"Actual model sparsity: {overall_sparsity:.2f}%")
+            print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
+            print(f"Total parameters: {total_params:,}")
+            print(f"Non-zero parameters: {non_zero_params:,}")
 
             # Calculate model GFLOPs
             gflops = calculate_model_gflops(model)
             print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
 
-            # Get model size before evaluation
-            model_size = get_model_disk_size_in_mb(model)
-            print(f"Model size: {model_size:.2f} MB")
-
-            # Calculate theoretical size of a dense model with pruned weights removed
-            theoretical_dense_pruned_size = 0.0
-            if config["pruning_amount"] is not None and config["pruning_amount"] > 0:
-                # Calculate what the size would be if we removed zeros (without actually creating the model)
-                theoretical_dense_pruned_size = calculate_pruned_dense_size(
-                    model, pruning_threshold=0.0
-                )
-                print(
-                    f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
-                )
-
-            # Initialize result dictionary with basic info
-            model_result_base = {
-                "model_type": model_name,
-                "pruning_percentage": 0
-                if "baseline" in model_name
-                else int(model_name.split("_")[1]),
-                "actual_sparsity": sparsity,
-                "model_size_mb": model_size,
-                "theoretical_dense_pruned_size_mb": theoretical_dense_pruned_size,
-                "gflops": gflops,
-            }
-
             # Evaluate on both splits
-            for split_index, (split, dataset) in enumerate(
-                [("clean", processed_test_data_clean), ("other", processed_test_data_other)]
-            ):
+            for split, dataset in [
+                ("clean", processed_test_data_clean),
+                ("other", processed_test_data_other),
+            ]:
                 print(f"\nEvaluating on {split} split...")
-
-                # Clear memory between dataset evaluations
-                if split_index > 0:
-                    print("Clearing memory between dataset evaluations...")
-                    clear_gpu_memory()
-
-                # Create a result key
-                result_key = f"{model_name}_{split}"
-
-                # Initialize result with base information
-                results[result_key] = model_result_base.copy()
-
-                # Save initial metrics with what we know so far
-                metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
-                with open(metrics_path, "w") as f:
-                    json.dump(results[result_key], f, indent=2)
 
                 # Initialize memory tracker for this run
                 tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
                 try:
-                    # Run evaluation
-                    scores, transcriptions = evaluate_model(
+                    # FIX: Unpack only two values from evaluate_model
+                    scores, result = evaluate_model(
                         model=model,
                         processor=processor,
                         dataset=dataset,
@@ -1264,37 +1314,59 @@ def main():
 
                     # Store and save results
                     if isinstance(scores, dict) and "error" not in scores:
-                        # Update results with scores
-                        results[result_key]["metrics"] = scores
+                        # Get model size
+                        model_size = get_model_disk_size_in_mb(model)
+
+                        # Calculate theoretical size of a dense model with pruned weights removed
+                        theoretical_dense_pruned_size = 0.0
+                        if (
+                            config.get("pruning_amount") is not None
+                            and config.get("pruning_amount") > 0
+                        ):
+                            # Calculate what the size would be if we removed zeros (without creating the model)
+                            theoretical_dense_pruned_size = calculate_pruned_dense_size(
+                                model, pruning_threshold=0.0
+                            )
+                            print(
+                                f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
+                            )
+
+                        # Extract pruning percentage from model name
+                        if "baseline" in model_name:
+                            pruning_pct = 0
+                        else:
+                            pruning_pct = int(model_name.split("_")[-1])
+
+                        # Build results dictionary
+                        results[f"{model_name}_{split}"] = {
+                            "metrics": scores,
+                            "model_size_mb": model_size,
+                            "model_type": model_name,
+                            "gflops": gflops,  # Add GFLOPs to results
+                            "pruning_percentage": pruning_pct,
+                            "encoder_only": config.get(
+                                "encoder_only", False
+                            ),  # Add encoder_only flag
+                            "actual_sparsity": overall_sparsity,
+                            "encoder_sparsity": encoder_sparsity,
+                            "total_parameters": total_params,  # Add total parameter count
+                            "non_zero_parameters": non_zero_params,  # Add non-zero parameter count
+                            "theoretical_dense_pruned_size_mb": theoretical_dense_pruned_size,  # Add theoretical size
+                        }
 
                         # Save metrics
+                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_summary.json")
                         with open(metrics_path, "w") as f:
-                            json.dump(results[result_key], f, indent=2)
-
-                        # Save transcriptions
-                        transcriptions_path = os.path.join(
-                            save_path, f"{model_name}_{split}_transcriptions.json"
-                        )
-                        with open(transcriptions_path, "w") as f:
-                            json.dump(transcriptions, f, indent=2)
-                    else:
-                        # Handle error
-                        error_msg = (
-                            scores.get("error", "Unknown error")
-                            if isinstance(scores, dict)
-                            else str(scores)
-                        )
-                        print(f"Error during evaluation: {error_msg}")
-                        results[result_key]["evaluation_error"] = error_msg
+                            json.dump(results[f"{model_name}_{split}"], f, indent=2)
+                        print(f"Saved metrics to {metrics_path}")
 
                 except Exception as e:
-                    print(f"Error evaluating {model_name} on {split} split: {e}")
-                    results[result_key]["evaluation_error"] = str(e)
+                    print(f"Error evaluating {model_name} on {split} split: {e!s}")
+                    continue
 
                 finally:
                     # Always close tracker and clear memory
                     tracker.close()
-                    clear_gpu_memory()
 
             # Save sparse model if this is a pruned model
             if "baseline" not in model_name:
@@ -1306,14 +1378,15 @@ def main():
                     result_key = f"{model_name}_{split}"
                     if result_key in results:
                         results[result_key]["sparse_model_size_mb"] = sparse_size
-                        results[result_key]["size_reduction_percent"] = (
-                            100.0
-                            * (results[result_key]["model_size_mb"] - sparse_size)
-                            / results[result_key]["model_size_mb"]
-                        )
+                        if sparse_size > 0 and results[result_key]["model_size_mb"] > 0:
+                            results[result_key]["size_reduction_percent"] = (
+                                100.0
+                                * (results[result_key]["model_size_mb"] - sparse_size)
+                                / results[result_key]["model_size_mb"]
+                            )
 
                         # Update the saved metrics file
-                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_metrics.json")
+                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_summary.json")
                         with open(metrics_path, "w") as f:
                             json.dump(results[result_key], f, indent=2)
 
@@ -1322,7 +1395,7 @@ def main():
             clear_gpu_memory()
 
         except Exception as e:
-            print(f"Error setting up {model_name}: {e}")
+            print(f"Error setting up {model_name}: {e!s}")
             continue
 
     # Save all results to a single file
@@ -1331,38 +1404,45 @@ def main():
         json.dump(results, f, indent=2)
     print(f"All results saved to {all_results_path}")
 
-    # Create plots
-    create_plots(
-        results=results,
-        metric_names=["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"],
-        plot_dir=PLOTS_DIR,
-    )
+    # FIX: Use a safer list of metrics for plotting
+    safe_metrics = []
+    for metric in ["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"]:
+        # Check if at least one result has this metric
+        has_metric = False
+        for model_result in results.values():
+            if "metrics" in model_result and metric in model_result["metrics"]:
+                has_metric = True
+                break
+        if has_metric:
+            safe_metrics.append(metric)
+
+    print(f"Plotting the following metrics: {safe_metrics}")
+
+    # Create plots with the validated metrics
+    create_plots(results=results, metric_names=safe_metrics, plot_dir=PLOTS_DIR, encoder_only=True)
 
     # Print summary
     print("\n" + "=" * 60)
-    print("L1 UNSTRUCTURED PRUNING EXPERIMENT SUMMARY")
+    print("L1 UNSTRUCTURED ENCODER-ONLY PRUNING EXPERIMENT SUMMARY")
     print("=" * 60)
 
     print("\nBaseline (0% pruning):")
     if "baseline_clean" in results:
         baseline = results["baseline_clean"]
-        if "metrics" in baseline and "WER" in baseline["metrics"]:
-            print(f"  WER: {baseline['metrics']['WER']:.4f}")
-        if "metrics" in baseline and "CER" in baseline["metrics"]:
-            print(f"  CER: {baseline['metrics']['CER']:.4f}")
-        if "metrics" in baseline and "RTF" in baseline["metrics"]:
-            print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
-        if "model_size_mb" in baseline:
-            print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
-        if "gflops" in baseline:
-            print(f"  GFLOPs: {baseline['gflops']:.4f}")
+        print(f"  WER: {baseline['metrics']['WER']:.4f}")
+        print(f"  CER: {baseline['metrics']['CER']:.4f}")
+        print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
+        print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
+        print(f"  GFLOPs: {baseline['gflops']:.4f}")
+        print(f"  Total Parameters: {baseline['total_parameters']:,}")
+        print(f"  Non-zero Parameters: {baseline['non_zero_parameters']:,}")
 
-    print("\nResults for different pruning percentages:")
+    print("\nResults for different encoder pruning percentages:")
     for percent in pruning_percentages:
         if percent == 0:
             continue
 
-        model_key = f"l1_{percent}_clean"
+        model_key = f"l1_encoder_{percent}_clean"
         if model_key in results:
             result = results[model_key]
 
@@ -1371,51 +1451,41 @@ def main():
             cer_change = "-"
             rtf_change = "-"
             size_change = "-"
+            theoretical_size_change = "-"
             gflops_change = "-"
+            param_change = "-"
 
             if "baseline_clean" in results:
                 baseline = results["baseline_clean"]
-
-                # Calculate metric changes
-                if (
-                    "metrics" in result
-                    and "WER" in result["metrics"]
-                    and "metrics" in baseline
-                    and "WER" in baseline["metrics"]
-                ):
-                    wer = result["metrics"]["WER"]
-                    wer_change = f"{(wer - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
-
-                if (
-                    "metrics" in result
-                    and "CER" in result["metrics"]
-                    and "metrics" in baseline
-                    and "CER" in baseline["metrics"]
-                ):
-                    cer = result["metrics"]["CER"]
-                    cer_change = f"{(cer - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
-
-                if (
-                    "metrics" in result
-                    and "RTF" in result["metrics"]
-                    and "metrics" in baseline
-                    and "RTF" in baseline["metrics"]
-                ):
+                if "WER" in result["metrics"] and "WER" in baseline["metrics"]:
+                    wer_change = f"{(result['metrics']['WER'] - baseline['metrics']['WER']) / baseline['metrics']['WER'] * 100:+.2f}%"
+                if "CER" in result["metrics"] and "CER" in baseline["metrics"]:
+                    cer_change = f"{(result['metrics']['CER'] - baseline['metrics']['CER']) / baseline['metrics']['CER'] * 100:+.2f}%"
+                if "RTF" in result["metrics"] and "RTF" in baseline["metrics"]:
                     rtf_change = f"{(result['metrics']['RTF'] - baseline['metrics']['RTF']) / baseline['metrics']['RTF'] * 100:+.2f}%"
 
-                # Check if sparse model size exists
                 if "sparse_model_size_mb" in result and "model_size_mb" in baseline:
                     size_change = f"{(result['sparse_model_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
+
+                if (
+                    "theoretical_dense_pruned_size_mb" in result
+                    and result["theoretical_dense_pruned_size_mb"] > 0
+                    and "model_size_mb" in baseline
+                ):
+                    theoretical_size_change = f"{(result['theoretical_dense_pruned_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
 
                 if "gflops" in result and "gflops" in baseline:
                     gflops_change = f"{(result['gflops'] - baseline['gflops']) / baseline['gflops'] * 100:+.2f}%"
 
-            print(f"\n{percent}% pruning:")
-            if "metrics" in result and "WER" in result["metrics"]:
+                if "non_zero_parameters" in result and "non_zero_parameters" in baseline:
+                    param_change = f"{(result['non_zero_parameters'] - baseline['non_zero_parameters']) / baseline['non_zero_parameters'] * 100:+.2f}%"
+
+            print(f"\n{percent}% encoder pruning:")
+            if "WER" in result["metrics"]:
                 print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
-            if "metrics" in result and "CER" in result["metrics"]:
+            if "CER" in result["metrics"]:
                 print(f"  CER: {result['metrics']['CER']:.4f} ({cer_change})")
-            if "metrics" in result and "RTF" in result["metrics"]:
+            if "RTF" in result["metrics"]:
                 print(f"  RTF: {result['metrics']['RTF']:.4f} ({rtf_change})")
             if "sparse_model_size_mb" in result:
                 print(
@@ -1425,21 +1495,39 @@ def main():
                 "theoretical_dense_pruned_size_mb" in result
                 and result["theoretical_dense_pruned_size_mb"] > 0
             ):
-                theoretical_change = "-"
-                if "model_size_mb" in baseline:
-                    theoretical_change = f"{(result['theoretical_dense_pruned_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%"
                 print(
-                    f"  Theoretical Dense Pruned Size: {result['theoretical_dense_pruned_size_mb']:.2f} MB ({theoretical_change})"
+                    f"  Theoretical Dense Pruned Size: {result['theoretical_dense_pruned_size_mb']:.2f} MB ({theoretical_size_change})"
                 )
             if "gflops" in result:
                 print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
             if "actual_sparsity" in result:
-                print(f"  Actual Sparsity: {result['actual_sparsity']:.2f}%")
+                print(f"  Overall Sparsity: {result['actual_sparsity']:.2f}%")
+            if "encoder_sparsity" in result:
+                print(f"  Encoder Sparsity: {result['encoder_sparsity']:.2f}%")
+            if "total_parameters" in result:
+                print(f"  Total Parameters: {result['total_parameters']:,}")
+            if "non_zero_parameters" in result:
+                print(f"  Non-zero Parameters: {result['non_zero_parameters']:,} ({param_change})")
 
     print("\nPlots saved to:", PLOTS_DIR)
     print("Sparse models saved to:", MODELS_DIR)
     print("Detailed metrics saved to:", L1_PRUNING_DIR)
+    print(
+        "\nNote: This experiment focused on pruning only the encoder component of the Whisper model"
+    )
 
 
 if __name__ == "__main__":
+    # Print experiment details
+    print("=" * 80)
+    print("WHISPER ENCODER-ONLY L1 UNSTRUCTURED PRUNING EXPERIMENT")
+    print("=" * 80)
+    print(
+        "This experiment applies L1 unstructured pruning ONLY to the encoder part of the Whisper model."
+    )
+    print("Pruning percentages: 0%, 10%, 20%, 30%, 40%, 50%")
+    print("Model: openai/whisper-small")
+    print("Test datasets: LibriSpeech test-clean and test-other")
+    print("=" * 80)
+
     main()
