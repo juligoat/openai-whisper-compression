@@ -8,219 +8,172 @@ from collections import deque
 import datasets
 import numpy as np
 import psutil
+import seaborn as sns
+import tabulate
 import torch
 import torch.nn.utils.prune as prune
 from evaluate import load
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
+# Set seaborn style
+sns.set(style="whitegrid")
+
 # Create results directory
-RESULTS_DIR = "pruning/whisper_targeted_pruning_results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
+RESULTS_DIR = "pruning/whisper_pruning_results"
+TARGETED_PRUNING_DIR = os.path.join(RESULTS_DIR, "targeted_pruning")
+MODELS_DIR = os.path.join(TARGETED_PRUNING_DIR, "models")
+
+for directory in [RESULTS_DIR, TARGETED_PRUNING_DIR, MODELS_DIR]:
+    os.makedirs(directory, exist_ok=True)
 
 
-def calculate_sparsity(model):
+def calculate_pruned_dense_size(model, pruning_threshold=0.0):
     """
-    Calculate the sparsity percentage and parameter counts in the model.
+    Calculate the theoretical size of a dense model with pruned weights removed.
+    This doesn't actually create the model, just calculates what the size would be.
 
     Args:
-        model: The PyTorch model
+        model: The pruned model with masked weights
+        pruning_threshold: Weights with absolute value below this threshold are considered pruned
 
     Returns:
-        tuple: (sparsity percentage, total parameters, non-zero parameters)
+        float: Size in MB that a dense model with pruned weights removed would have
     """
-    total_params = 0
-    zero_params = 0
+    print("\n=== Calculating theoretical dense model size with pruned weights removed ===")
 
+    total_params_original = 0
+    total_params_pruned = 0
+    total_bytes_original = 0
+    total_bytes_dense_pruned = 0
+
+    # Count parameters and calculate theoretical size
     for name, param in model.named_parameters():
-        if "weight" in name:  # Only consider weight parameters
-            total_params += param.numel()
-            zero_params += torch.sum(param == 0).item()
+        param_size_bytes = param.numel() * 4  # 4 bytes per float32
+        total_params_original += param.numel()
+        total_bytes_original += param_size_bytes
 
-    if total_params == 0:
-        return 0.0, 0, 0
+        if "weight" in name and param.dim() > 1:  # Only consider weight matrices
+            # Find pruned weights
+            pruned_mask = torch.abs(param) <= pruning_threshold
+            pruned_percentage = 100.0 * torch.sum(pruned_mask).item() / param.numel()
 
-    sparsity = 100.0 * zero_params / total_params
-    non_zero_params = total_params - zero_params
-    return sparsity, total_params, non_zero_params
+            # Track non-zero parameters
+            non_zero_params = param.numel() - torch.sum(pruned_mask).item()
+            total_params_pruned += non_zero_params
 
+            # Calculate dense size without zeros
+            param_dense_pruned_bytes = non_zero_params * 4  # Only non-zero elements at 4 bytes each
+            total_bytes_dense_pruned += param_dense_pruned_bytes
 
-def get_component_layers(model, component):
-    """
-    Get all layers in encoder or decoder with their indices.
+            # For significant pruning, log details
+            if pruned_percentage > 5 and param.numel() > 10000:
+                print(f"Layer {name}: {pruned_percentage:.1f}% pruned")
+                print(f"  Original: {param_size_bytes/1024/1024:.2f} MB")
+                print(f"  Dense pruned: {param_dense_pruned_bytes/1024/1024:.2f} MB")
+        else:
+            # For non-weight parameters, size remains the same
+            total_params_pruned += param.numel()
+            total_bytes_dense_pruned += param_size_bytes
 
-    Args:
-        model: The WhisperForConditionalGeneration model
-        component: 'encoder' or 'decoder'
+    # Convert to MB
+    original_size_mb = total_bytes_original / (1024 * 1024)
+    dense_pruned_size_mb = total_bytes_dense_pruned / (1024 * 1024)
 
-    Returns:
-        tuple: (number of layers, dict mapping layer indices to layer modules)
-    """
-    # Get all layers in the component
-    layer_modules = {}
-
-    # First find the highest layer index to determine total count
-    max_layer_idx = -1
-    for name, module in model.named_modules():
-        if f"{component}.layers." in name:
-            parts = name.split(f"{component}.layers.")[-1].split(".")
-            if parts[0].isdigit():
-                layer_idx = int(parts[0])
-                max_layer_idx = max(max_layer_idx, layer_idx)
-
-    # Layer indices are 0-indexed, so add 1 for count
-    layer_count = max_layer_idx + 1
-
-    # Print out which component we're analyzing
-    print(f"Found {layer_count} layers in the {component}")
-
-    return layer_count
-
-
-def apply_targeted_l1_pruning(
-    model, amount=0.3, target_component="encoder", target_section="early", make_permanent=False
-):
-    """
-    Apply L1 unstructured pruning to specific parts of the Whisper model.
-
-    Args:
-        model: The WhisperForConditionalGeneration model
-        amount: Amount of weights to prune (0.3 = 30%)
-        target_component: 'encoder' or 'decoder'
-        target_section: 'early', 'middle', or 'late'
-        make_permanent: Whether to make pruning permanent
-
-    Returns:
-        Pruned model
-    """
-    # For Whisper small, we know there are exactly 12 encoder and 12 decoder layers
-    # So we'll explicitly define each section as 4 layers
-
-    # Determine layer indices for the target section
-    if target_section == "early":
-        target_layers = [0, 1, 2, 3]  # First 4 layers
-    elif target_section == "middle":
-        target_layers = [4, 5, 6, 7]  # Middle 4 layers
-    elif target_section == "late":
-        target_layers = [8, 9, 10, 11]  # Last 4 layers
-    else:
-        raise ValueError(f"Unknown target section: {target_section}")
-
-    print(f"Targeting {target_component} {target_section} layers: {target_layers}")
-
-    # Get parameters to prune based on target section
-    params_to_prune = []
-    prunable_linear_count = 0
-    targeted_linear_count = 0
-
-    # First count all linear layers in the model for reference
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and hasattr(module, "weight"):
-            prunable_linear_count += 1
-
-            # Check if this linear layer belongs to our target component and section
-            if f"{target_component}.layers." in name:
-                parts = name.split(f"{target_component}.layers.")[1].split(".")
-                if parts[0].isdigit() and int(parts[0]) in target_layers:
-                    params_to_prune.append((module, "weight"))
-                    targeted_linear_count += 1
-
-    # Print statistics about what we're pruning
-    print(f"Total prunable linear layers in model: {prunable_linear_count}")
-    print(f"Linear layers in {target_component} {target_section} section: {targeted_linear_count}")
-
-    if not params_to_prune:
-        print(
-            f"Warning: No parameters found to prune for {target_component} {target_section} section!"
+    # Report on size reduction
+    if total_params_original > 0:
+        param_reduction = (
+            100.0 * (total_params_original - total_params_pruned) / total_params_original
         )
-        return model
+        size_reduction = 100.0 * (original_size_mb - dense_pruned_size_mb) / original_size_mb
 
-    print(
-        f"Found {len(params_to_prune)} modules to prune in {target_component} {target_section} section with L1 unstructured pruning, amount={amount}"
+        print(f"Original parameters: {total_params_original:,}")
+        print(f"Non-zero parameters: {total_params_pruned:,}")
+        print(f"Parameter reduction: {param_reduction:.1f}%")
+        print(f"Original size: {original_size_mb:.2f} MB")
+        print(f"Theoretical dense pruned size: {dense_pruned_size_mb:.2f} MB")
+        print(f"Size reduction: {size_reduction:.1f}%")
+
+    return dense_pruned_size_mb
+
+
+def calculate_model_gflops(model):
+    """
+    Calculate approximate GFLOPs for Whisper model accounting for pruning.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+
+    Returns:
+        float: Estimated GFLOPs
+    """
+    # Track FLOPs by module type
+    flops_by_type = {"encoder": 0, "decoder": 0, "other": 0}
+
+    total_params = 0
+    non_zero_params = 0
+
+    # Analyze linear layers (where most computation happens)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            if not hasattr(module, "weight"):
+                continue
+
+            # Get layer dimensions
+            in_features = module.in_features
+            out_features = module.out_features
+
+            # Calculate theoretical FLOPs for this layer (multiply-add operations)
+            # Each output element requires in_features multiplications and in_features-1 additions
+            weight = module.weight
+
+            # Calculate sparsity and non-zero operations
+            weight_sparsity = (
+                torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
+            )
+            non_zero_ops = 2 * in_features * out_features * (1 - weight_sparsity)
+
+            # Categorize by location in model
+            if "encoder" in name:
+                flops_by_type["encoder"] += non_zero_ops
+            elif "decoder" in name:
+                flops_by_type["decoder"] += non_zero_ops
+            else:
+                flops_by_type["other"] += non_zero_ops
+
+            # Track parameter stats
+            total_params += weight.numel()
+            non_zero_params += (weight != 0).sum().item()
+
+    # For a typical forward pass and generation in Whisper:
+    # 1. Encoder processes the input once
+    # 2. Decoder runs multiple times (typically sequence length)
+    # Simplified assumption: avg sequence length of 25 tokens
+    avg_sequence_length = 25
+    total_flops = (
+        flops_by_type["encoder"]
+        + avg_sequence_length * flops_by_type["decoder"]
+        + flops_by_type["other"]
     )
 
-    # Apply L1 unstructured pruning
-    success_count = 0
-    try:
-        prune.global_unstructured(
-            params_to_prune, pruning_method=prune.L1Unstructured, amount=amount
-        )
-        success_count = len(params_to_prune)
-    except Exception as e:
-        print(f"Error during global unstructured pruning: {e}")
+    # Convert to GFLOPs
+    total_gflops = total_flops / 1e9
 
-        # Try pruning modules individually if global pruning fails
-        for i, (module, param_name) in enumerate(params_to_prune):
-            try:
-                prune.l1_unstructured(module, param_name, amount=amount)
-                success_count += 1
-            except Exception as e2:
-                print(f"Error pruning module {i}: {e2}")
+    # Print detailed breakdown
+    print("\nEstimated GFLOPs by component:")
+    for component, flops in flops_by_type.items():
+        gflops = flops / 1e9
+        percentage = (flops / sum(flops_by_type.values())) * 100
+        print(f"  {component}: {gflops:.4f} GFLOPs ({percentage:.1f}%)")
 
-    print(f"Successfully applied pruning to {success_count}/{len(params_to_prune)} modules")
+    if total_params > 0:
+        print("\nParameter efficiency:")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Non-zero parameters: {non_zero_params:,}")
+        print(f"  Overall sparsity: {100 * (1 - non_zero_params / total_params):.2f}%")
 
-    # Make pruning permanent if requested
-    if make_permanent:
-        print("Making pruning permanent...")
-        permanent_count = 0
-        for module, param_name in params_to_prune:
-            try:
-                # Only make permanent if the module has a weight_mask attribute
-                if hasattr(module, f"{param_name}_mask"):
-                    prune.remove(module, param_name)
-                    permanent_count += 1
-            except Exception as e:
-                print(f"Could not make pruning permanent for {module}: {e}")
-        print(f"Made pruning permanent for {permanent_count}/{len(params_to_prune)} modules")
+    print(f"\nTotal estimated GFLOPs: {total_gflops:.4f}")
 
-    return model
-
-
-def load_whisper_model(model_name, device, pruning_config=None, make_permanent=True):
-    """
-    Load Whisper model and optionally apply targeted pruning.
-
-    Args:
-        model_name: The Whisper model name
-        device: Device to load the model to
-        pruning_config: Dict with keys 'amount', 'component', 'section' or None for no pruning
-        make_permanent: Whether to make pruning permanent
-
-    Returns:
-        WhisperForConditionalGeneration model
-    """
-    try:
-        # Load model
-        model = WhisperForConditionalGeneration.from_pretrained(model_name, device_map=None)
-
-        # Apply pruning if specified
-        if pruning_config is not None and pruning_config.get("amount", 0) > 0:
-            print(
-                f"Applying targeted pruning to {pruning_config['component']} {pruning_config['section']} "
-                f"section with amount={pruning_config['amount']}"
-            )
-
-            model = apply_targeted_l1_pruning(
-                model,
-                amount=pruning_config["amount"],
-                target_component=pruning_config["component"],
-                target_section=pruning_config["section"],
-                make_permanent=make_permanent,
-            )
-
-            # Calculate and print sparsity
-            sparsity, total_params, non_zero_params = calculate_sparsity(model)
-            print(f"Model sparsity after pruning: {sparsity:.2f}%")
-            print(f"Total parameters: {total_params:,}")
-            print(f"Non-zero parameters: {non_zero_params:,}")
-
-        # Move model to device
-        model = model.to(device)
-        model.config.forced_decoder_ids = None
-        return model
-
-    except Exception as e:
-        print(f"Error loading model {model_name}: {e}")
-        raise
+    return total_gflops
 
 
 class WhisperMemoryTracker:
@@ -403,6 +356,322 @@ class WhisperMemoryTracker:
         """Cleanup and save final metrics."""
         self.print_summary()
         self.save_metrics()
+
+
+def save_sparse_model(model, output_path):
+    """
+    Convert pruned model to sparse format for storage efficiency.
+
+    Args:
+        model: Pruned PyTorch model
+        output_path: Path to save the sparse model
+
+    Returns:
+        float: Size of saved sparse model in MB
+    """
+    sparse_state_dict = {}
+    original_params = 0
+    sparse_params = 0
+
+    print("\n=== Converting model to sparse format ===")
+
+    # Track sparsity statistics by layer type
+    sparsity_by_type = {}
+
+    for name, param in model.state_dict().items():
+        # Calculate original size in bytes (assuming float32)
+        original_params += param.numel() * 4
+
+        # Determine parameter type for reporting
+        param_type = "unknown"
+        if "encoder" in name:
+            param_type = "encoder"
+        elif "decoder" in name:
+            param_type = "decoder"
+
+        if "weight" in name:
+            param_type += "_weight"
+        elif "bias" in name:
+            param_type += "_bias"
+
+        # For parameters with significant sparsity, convert to sparse format
+        if param.dim() > 1 and torch.sum(param == 0) > 0.3 * param.numel():
+            # Calculate sparsity percentage
+            total_elements = param.numel()
+            zero_elements = torch.sum(param == 0).item()
+            sparsity = 100.0 * zero_elements / total_elements
+
+            # Update sparsity stats
+            if param_type not in sparsity_by_type:
+                sparsity_by_type[param_type] = {"total": 0, "zeros": 0}
+            sparsity_by_type[param_type]["total"] += total_elements
+            sparsity_by_type[param_type]["zeros"] += zero_elements
+
+            # Convert to sparse tensor
+            sparse_param = param.to_sparse()
+            sparse_state_dict[name] = sparse_param
+
+            # Calculate expected sparse storage size (rough estimate)
+            non_zeros = total_elements - zero_elements
+            # COO format: indices (2 * non_zeros * 4 bytes) + values (non_zeros * 4 bytes)
+            param_sparse_bytes = (2 * non_zeros * 4) + (non_zeros * 4)
+            sparse_params += param_sparse_bytes
+
+            # Print info for significant layers
+            if total_elements > 100000:  # Only print for large layers
+                print(
+                    f"  Converting {name}: {sparsity:.1f}% sparse ({zero_elements}/{total_elements} zeros)"
+                )
+        else:
+            # Keep as dense
+            sparse_state_dict[name] = param
+            sparse_params += param.numel() * 4  # 4 bytes per float32
+
+    # Save sparse model
+    try:
+        print(f"Saving sparse model to {output_path}")
+        torch.save(sparse_state_dict, output_path)
+
+        # Get actual saved size
+        actual_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        estimated_dense_mb = original_params / (1024 * 1024)
+        estimated_sparse_mb = sparse_params / (1024 * 1024)
+
+        # Print sparsity by parameter type
+        print("\nSparsity by parameter type:")
+        for param_type, stats in sparsity_by_type.items():
+            sparsity_pct = 100.0 * stats["zeros"] / stats["total"] if stats["total"] > 0 else 0
+            print(
+                f"  {param_type}: {sparsity_pct:.1f}% sparse ({stats['zeros']}/{stats['total']} zeros)"
+            )
+
+        # Print size statistics
+        print("\nModel size summary:")
+        print(f"  Dense model size (theoretical): {estimated_dense_mb:.2f} MB")
+        print(f"  Sparse model size (theoretical): {estimated_sparse_mb:.2f} MB")
+        print(f"  Sparse model size (actual file): {actual_size_mb:.2f} MB")
+        print(f"  Compression ratio: {estimated_dense_mb/actual_size_mb:.2f}x")
+        print(
+            f"  Size reduction: {100.0 * (estimated_dense_mb - actual_size_mb) / estimated_dense_mb:.1f}%"
+        )
+
+        return actual_size_mb
+    except Exception as e:
+        print(f"Error saving sparse model: {e}")
+        return 0
+
+
+def get_targeted_modules(model, target_section, target_component):
+    """
+    Get modules belonging to a specific section (early, middle, late)
+    and component (encoder, decoder) of the Whisper model.
+
+    Args:
+        model: WhisperForConditionalGeneration model
+        target_section: 'early', 'middle', or 'late'
+        target_component: 'encoder' or 'decoder'
+
+    Returns:
+        List of tuples (module, parameter_name) to prune
+    """
+    # Get all layers of the specified component
+    component_modules = []
+    for name, module in model.named_modules():
+        if f"{target_component}.layers" in name and isinstance(module, torch.nn.Linear):
+            component_modules.append((name, module))
+
+    # Sort by layer index - extract layer number from name
+    def get_layer_idx(name):
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    pass
+        return -1
+
+    component_modules.sort(key=lambda x: get_layer_idx(x[0]))
+
+    # Group by layer index
+    layers_dict = {}
+    for name, module in component_modules:
+        layer_idx = get_layer_idx(name)
+        if layer_idx not in layers_dict:
+            layers_dict[layer_idx] = []
+        layers_dict[layer_idx].append((name, module))
+
+    # Get total number of layers
+    layer_indices = sorted(layers_dict.keys())
+    num_layers = len(layer_indices)
+
+    if num_layers == 0:
+        return []
+
+    # Define early, middle, late sections (4 layers each)
+    section_size = 4  # Fixed at 4 layers as requested
+
+    if target_section == "early":
+        target_indices = layer_indices[:section_size]
+    elif target_section == "middle":
+        if num_layers <= section_size * 2:
+            start = section_size
+        else:
+            start = (num_layers - section_size) // 2
+        target_indices = layer_indices[start : start + section_size]
+    elif target_section == "late":
+        target_indices = layer_indices[-section_size:]
+    else:
+        raise ValueError(f"Unknown target section: {target_section}")
+
+    # Get all modules in the target layers
+    target_modules = []
+    for idx in target_indices:
+        for name, module in layers_dict[idx]:
+            if hasattr(module, "weight"):
+                target_modules.append((module, "weight"))
+
+    print(
+        f"Selected {len(target_modules)} modules in {target_section} {target_component} layers (indices: {target_indices})"
+    )
+    return target_modules
+
+
+def apply_targeted_pruning(model, amount, target_section, target_component, make_permanent=False):
+    """
+    Apply L1 unstructured pruning to specific sections of the Whisper model.
+
+    Args:
+        model: The WhisperForConditionalGeneration model
+        amount: Amount of weights to prune (0.3 = 30%)
+        target_section: 'early', 'middle', or 'late'
+        target_component: 'encoder' or 'decoder'
+        make_permanent: Whether to make pruning permanent
+
+    Returns:
+        Pruned model
+    """
+    # Get parameters to prune based on target section and component
+    params_to_prune = get_targeted_modules(model, target_section, target_component)
+
+    if not params_to_prune:
+        print(f"Warning: No parameters found to prune in {target_section} {target_component}!")
+        return model
+
+    print(
+        f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
+    )
+
+    # Apply L1 unstructured pruning
+    success_count = 0
+    try:
+        prune.global_unstructured(
+            params_to_prune, pruning_method=prune.L1Unstructured, amount=amount
+        )
+        success_count = len(params_to_prune)
+    except Exception as e:
+        print(f"Error during global unstructured pruning: {e}")
+
+        # Try pruning modules individually if global pruning fails
+        for i, (module, param_name) in enumerate(params_to_prune):
+            try:
+                prune.l1_unstructured(module, param_name, amount=amount)
+                success_count += 1
+            except Exception as e2:
+                print(f"Error pruning module {i}: {e2}")
+
+    print(f"Successfully applied pruning to {success_count}/{len(params_to_prune)} modules")
+
+    # Make pruning permanent if requested
+    if make_permanent:
+        print("Making pruning permanent...")
+        permanent_count = 0
+        for module, param_name in params_to_prune:
+            try:
+                # Only make permanent if the module has a weight_mask attribute
+                if hasattr(module, f"{param_name}_mask"):
+                    prune.remove(module, param_name)
+                    permanent_count += 1
+            except Exception as e:
+                print(f"Could not make pruning permanent for {module}: {e}")
+        print(f"Made pruning permanent for {permanent_count}/{len(params_to_prune)} modules")
+
+    return model
+
+
+def calculate_sparsity(model):
+    """
+    Calculate the sparsity percentage and parameter counts in the model.
+
+    Args:
+        model: The PyTorch model
+
+    Returns:
+        tuple: (sparsity percentage, total parameters, non-zero parameters)
+    """
+    total_params = 0
+    zero_params = 0
+
+    for name, param in model.named_parameters():
+        if "weight" in name:  # Only consider weight parameters
+            total_params += param.numel()
+            zero_params += torch.sum(param == 0).item()
+
+    if total_params == 0:
+        return 0.0, 0, 0
+
+    sparsity = 100.0 * zero_params / total_params
+    non_zero_params = total_params - zero_params
+    return sparsity, total_params, non_zero_params
+
+
+def load_whisper_model(model_name, device, targeted_pruning_config=None, make_permanent=True):
+    """
+    Load Whisper model and optionally apply targeted pruning.
+
+    Args:
+        model_name: The Whisper model name
+        device: Device to load the model to
+        targeted_pruning_config: Dict with keys 'amount', 'section', 'component' or None for no pruning
+        make_permanent: Whether to make pruning permanent
+
+    Returns:
+        WhisperForConditionalGeneration model
+    """
+    try:
+        # Load model without device_map
+        model = WhisperForConditionalGeneration.from_pretrained(model_name, device_map=None)
+
+        # Apply targeted pruning if specified
+        if targeted_pruning_config is not None:
+            amount = targeted_pruning_config.get("amount", 0)
+            section = targeted_pruning_config.get("section", "early")
+            component = targeted_pruning_config.get("component", "encoder")
+
+            if amount > 0:
+                print(f"Applying targeted L1 pruning with amount={amount} to {section} {component}")
+                model = apply_targeted_pruning(
+                    model,
+                    amount=amount,
+                    target_section=section,
+                    target_component=component,
+                    make_permanent=make_permanent,
+                )
+
+            # Calculate and print sparsity
+            sparsity, total_params, non_zero_params = calculate_sparsity(model)
+            print(f"Model sparsity after pruning: {sparsity:.2f}%")
+            print(f"Total parameters: {total_params:,}")
+            print(f"Non-zero parameters: {non_zero_params:,}")
+
+        # Move model to device
+        model = model.to(device)
+        model.config.forced_decoder_ids = None
+        return model
+
+    except Exception as e:
+        print(f"Error loading model {model_name}: {e}")
+        raise
 
 
 def clear_gpu_memory():
@@ -677,11 +946,95 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     return buffer.getbuffer().nbytes / (1024**2)
 
 
+def generate_summary_table(results):
+    """
+    Generate a summary table of the results.
+
+    Args:
+        results: Dictionary of results
+
+    Returns:
+        str: Formatted summary table
+    """
+    # Prepare table headers and rows
+    headers = [
+        "Target",
+        "Sparsity",
+        "Split",
+        "WER",
+        "CER",
+        "RTF",
+        "Model Size (MB)",
+        "Sparse Size (MB)",
+        "GFLOPs",
+        "Actual Sparsity (%)",
+    ]
+    rows = []
+
+    # First add baseline rows
+    for split in ["clean", "other"]:
+        baseline_key = f"baseline_{split}"
+        if baseline_key in results:
+            baseline = results[baseline_key]
+            baseline_row = [
+                "Baseline",
+                "0%",
+                split.capitalize(),
+                f"{baseline['metrics']['WER']:.4f}",
+                f"{baseline['metrics']['CER']:.4f}",
+                f"{baseline['metrics']['RTF']:.6f}",
+                f"{baseline['model_size_mb']:.2f}",
+                "N/A",
+                f"{baseline['gflops']:.4f}",
+                "0.00",
+            ]
+            rows.append(baseline_row)
+
+    # Add rows for each pruning configuration
+    for model_key, result in results.items():
+        if model_key.startswith("baseline"):
+            continue
+
+        # Extract target section, component, sparsity, and split from the model key
+        parts = model_key.split("_")
+        if len(parts) >= 4:  # Format: targeted_section_component_sparsity_split
+            section = parts[1]
+            component = parts[2]
+            sparsity = parts[3]
+            split = parts[4] if len(parts) > 4 else "unknown"
+
+            target = f"{section.capitalize()} {component.capitalize()}"
+
+            # Create row
+            row = [
+                target,
+                f"{sparsity}%",
+                split.capitalize(),
+                f"{result['metrics']['WER']:.4f}",
+                f"{result['metrics']['CER']:.4f}",
+                f"{result['metrics']['RTF']:.6f}",
+                f"{result['model_size_mb']:.2f}",
+                f"{result.get('sparse_model_size_mb', 'N/A')}"
+                if "sparse_model_size_mb" in result
+                else "N/A",
+                f"{result['gflops']:.4f}",
+                f"{result['actual_sparsity']:.2f}",
+            ]
+            rows.append(row)
+
+    # Generate table
+    if not rows:
+        return "No results available for summary table."
+
+    table = tabulate.tabulate(rows, headers=headers, tablefmt="pipe")
+    return table
+
+
 def main():
-    # Configuration to match the quantization code
+    # Configuration to match the original script
     original_model_name = "openai/whisper-small"
-    batch_size = 16  # Match the quantization code batch size
-    save_path = RESULTS_DIR
+    batch_size = 16  # Match the original batch size
+    save_path = TARGETED_PRUNING_DIR
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     if (
         not torch.cuda.is_available()
@@ -691,86 +1044,44 @@ def main():
         device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define pruning configurations to test
-    pruning_configs = [
-        # Baseline (no pruning)
-        {"name": "baseline", "config": None},
-        # 30% pruning configurations
-        {
-            "name": "encoder_early_30",
-            "config": {"amount": 0.3, "component": "encoder", "section": "early"},
-        },
-        {
-            "name": "encoder_middle_30",
-            "config": {"amount": 0.3, "component": "encoder", "section": "middle"},
-        },
-        {
-            "name": "encoder_late_30",
-            "config": {"amount": 0.3, "component": "encoder", "section": "late"},
-        },
-        {
-            "name": "decoder_early_30",
-            "config": {"amount": 0.3, "component": "decoder", "section": "early"},
-        },
-        {
-            "name": "decoder_middle_30",
-            "config": {"amount": 0.3, "component": "decoder", "section": "middle"},
-        },
-        {
-            "name": "decoder_late_30",
-            "config": {"amount": 0.3, "component": "decoder", "section": "late"},
-        },
-        # 40% pruning configurations
-        {
-            "name": "encoder_early_40",
-            "config": {"amount": 0.4, "component": "encoder", "section": "early"},
-        },
-        {
-            "name": "encoder_middle_40",
-            "config": {"amount": 0.4, "component": "encoder", "section": "middle"},
-        },
-        {
-            "name": "encoder_late_40",
-            "config": {"amount": 0.4, "component": "encoder", "section": "late"},
-        },
-        {
-            "name": "decoder_early_40",
-            "config": {"amount": 0.4, "component": "decoder", "section": "early"},
-        },
-        {
-            "name": "decoder_middle_40",
-            "config": {"amount": 0.4, "component": "decoder", "section": "middle"},
-        },
-        {
-            "name": "decoder_late_40",
-            "config": {"amount": 0.4, "component": "decoder", "section": "late"},
-        },
-    ]
+    # Define the targeted pruning configurations
+    sections = ["early", "middle", "late"]
+    components = ["encoder", "decoder"]
+    pruning_percentages = [30, 40]  # Only 30% and 40% sparsity
 
-    # Print the test plan
-    print("\nTEST PLAN:")
-    print("1. Baseline: No pruning")
-    print("2. Targeted pruning at 30% sparsity:")
-    print("   - Early encoder layers (layers 0-3)")
-    print("   - Middle encoder layers (layers 4-7)")
-    print("   - Late encoder layers (layers 8-11)")
-    print("   - Early decoder layers (layers 0-3)")
-    print("   - Middle decoder layers (layers 4-7)")
-    print("   - Late decoder layers (layers 8-11)")
-    print("3. Targeted pruning at 40% sparsity for the same sections")
+    targeted_configs = []
+
+    # Create a config for each combination of section, component, and sparsity
+    for section in sections:
+        for component in components:
+            for percent in pruning_percentages:
+                config_name = f"targeted_{section}_{component}_{percent}"
+                targeted_configs.append(
+                    (
+                        config_name,
+                        {
+                            "amount": percent / 100,  # Convert percentage to fraction
+                            "section": section,
+                            "component": component,
+                        },
+                    )
+                )
 
     # Load processor once - can be shared across models
     processor = WhisperProcessor.from_pretrained(original_model_name)
 
-    # Load a smaller subset of test data for faster evaluation
+    # Load full datasets (matching the original code)
     print("\nLoading datasets...")
-    dataset_clean = load_librispeech(num_samples=500, split="test.clean")
+    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")  # Use full test.clean
+    dataset_other = load_librispeech(num_samples=2939, split="test.other")  # Use full test.other
 
     print(f"Clean dataset: {len(dataset_clean)} samples")
+    print(f"Other dataset: {len(dataset_other)} samples")
 
     # Process datasets
     print("\nProcessing datasets...")
     processed_test_data_clean = dataset_clean.map(lambda x: map_to_feats(x, processor))
+    processed_test_data_other = dataset_other.map(lambda x: map_to_feats(x, processor))
 
     # Initialize metrics
     metrics = {"WER": load("wer"), "CER": load("cer")}
@@ -778,9 +1089,81 @@ def main():
     # Store results
     results = {}
 
-    # Evaluate each configuration
-    for pruning_config in pruning_configs:
-        config_name = pruning_config["name"]
+    # First evaluate baseline (no pruning)
+    print("\n" + "=" * 50)
+    print("Evaluating baseline (no pruning)")
+    print("=" * 50)
+
+    clear_gpu_memory()
+
+    try:
+        # Load model without pruning
+        model = load_whisper_model(
+            model_name=original_model_name, device=device, targeted_pruning_config=None
+        )
+
+        # Calculate actual sparsity and parameter counts
+        sparsity, total_params, non_zero_params = calculate_sparsity(model)
+
+        # Calculate model GFLOPs
+        gflops = calculate_model_gflops(model)
+
+        # Evaluate on both splits
+        for split, dataset in [
+            ("clean", processed_test_data_clean),
+            ("other", processed_test_data_other),
+        ]:
+            print(f"\nEvaluating baseline on {split} split...")
+            tracker = WhisperMemoryTracker(f"baseline_{split}", save_path)
+
+            try:
+                scores, result = evaluate_model(
+                    model=model,
+                    processor=processor,
+                    dataset=dataset,
+                    metrics=metrics,
+                    memory_tracker=tracker,
+                    batch_size=batch_size,
+                    split=split,
+                )
+
+                # Store results
+                if isinstance(scores, dict) and "error" not in scores:
+                    # Get model size
+                    model_size = get_model_disk_size_in_mb(model)
+
+                    # Build results dictionary
+                    results[f"baseline_{split}"] = {
+                        "metrics": scores,
+                        "model_size_mb": model_size,
+                        "model_type": "baseline",
+                        "gflops": gflops,
+                        "pruning_percentage": 0,
+                        "actual_sparsity": sparsity,
+                        "total_parameters": total_params,
+                        "non_zero_parameters": non_zero_params,
+                    }
+
+                    # Save metrics
+                    metrics_path = os.path.join(save_path, f"baseline_{split}_summary.json")
+                    with open(metrics_path, "w") as f:
+                        json.dump(results[f"baseline_{split}"], f, indent=2)
+
+            except Exception as e:
+                print(f"Error evaluating baseline on {split} split: {e}")
+            finally:
+                # Always close tracker
+                tracker.close()
+
+        # Clear model from memory
+        del model
+        clear_gpu_memory()
+
+    except Exception as e:
+        print(f"Error setting up baseline model: {e}")
+
+    # Evaluate each targeted pruning configuration
+    for config_name, pruning_config in targeted_configs:
         print("\n" + "=" * 50)
         print(f"Evaluating {config_name}")
         print("=" * 50)
@@ -793,7 +1176,7 @@ def main():
             model = load_whisper_model(
                 model_name=original_model_name,
                 device=device,
-                pruning_config=pruning_config["config"],
+                targeted_pruning_config=pruning_config,
                 make_permanent=True,
             )
 
@@ -803,146 +1186,102 @@ def main():
             print(f"Total parameters: {total_params:,}")
             print(f"Non-zero parameters: {non_zero_params:,}")
 
-            # Get model size
-            model_size = get_model_disk_size_in_mb(model)
+            # Calculate model GFLOPs
+            gflops = calculate_model_gflops(model)
+            print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
 
-            # Evaluate on clean split
-            print("\nEvaluating on clean split...")
+            # Evaluate on both splits
+            for split, dataset in [
+                ("clean", processed_test_data_clean),
+                ("other", processed_test_data_other),
+            ]:
+                print(f"\nEvaluating {config_name} on {split} split...")
+                tracker = WhisperMemoryTracker(f"{config_name}_{split}", save_path)
 
-            # Initialize memory tracker for this run
-            tracker = WhisperMemoryTracker(f"{config_name}_clean", save_path)
+                try:
+                    scores, result = evaluate_model(
+                        model=model,
+                        processor=processor,
+                        dataset=dataset,
+                        metrics=metrics,
+                        memory_tracker=tracker,
+                        batch_size=batch_size,
+                        split=split,
+                    )
 
-            try:
-                # Evaluate the model
-                scores, result = evaluate_model(
-                    model=model,
-                    processor=processor,
-                    dataset=processed_test_data_clean,
-                    metrics=metrics,
-                    memory_tracker=tracker,
-                    batch_size=batch_size,
-                    split="clean",
-                )
+                    # Store results
+                    if isinstance(scores, dict) and "error" not in scores:
+                        # Get model size
+                        model_size = get_model_disk_size_in_mb(model)
 
-                # Store results
-                if isinstance(scores, dict) and "error" not in scores:
-                    # Build results dictionary
-                    results[config_name] = {
-                        "metrics": scores,
-                        "model_size_mb": model_size,
-                        "actual_sparsity": sparsity,
-                        "total_parameters": total_params,
-                        "non_zero_parameters": non_zero_params,
-                    }
+                        # Build results dictionary
+                        results[f"{config_name}_{split}"] = {
+                            "metrics": scores,
+                            "model_size_mb": model_size,
+                            "model_type": config_name,
+                            "gflops": gflops,
+                            "pruning_percentage": pruning_config["amount"] * 100,
+                            "actual_sparsity": sparsity,
+                            "total_parameters": total_params,
+                            "non_zero_parameters": non_zero_params,
+                            "target_section": pruning_config["section"],
+                            "target_component": pruning_config["component"],
+                        }
 
-                    # Save metrics
-                    metrics_path = os.path.join(save_path, f"{config_name}_summary.json")
+                        # Save metrics
+                        metrics_path = os.path.join(
+                            save_path, f"{config_name}_{split}_summary.json"
+                        )
+                        with open(metrics_path, "w") as f:
+                            json.dump(results[f"{config_name}_{split}"], f, indent=2)
+
+                except Exception as e:
+                    print(f"Error evaluating {config_name} on {split} split: {e}")
+                finally:
+                    # Always close tracker
+                    tracker.close()
+
+            # Save sparse model
+            sparse_model_path = os.path.join(MODELS_DIR, f"{config_name}_sparse.pt")
+            sparse_size = save_sparse_model(model, sparse_model_path)
+
+            # Update results with sparse model size
+            for split in ["clean", "other"]:
+                result_key = f"{config_name}_{split}"
+                if result_key in results:
+                    results[result_key]["sparse_model_size_mb"] = sparse_size
+
+                    # Update the saved metrics file
+                    metrics_path = os.path.join(save_path, f"{config_name}_{split}_summary.json")
                     with open(metrics_path, "w") as f:
-                        json.dump(results[config_name], f, indent=2)
-                    print(f"Saved metrics to {metrics_path}")
-
-            except Exception as e:
-                print(f"Error evaluating {config_name}: {e!s}")
-                continue
-
-            finally:
-                # Always close tracker and clear memory
-                tracker.close()
+                        json.dump(results[result_key], f, indent=2)
 
             # Clear model from memory
             del model
             clear_gpu_memory()
 
         except Exception as e:
-            print(f"Error setting up {config_name}: {e!s}")
+            print(f"Error setting up {config_name}: {e}")
             continue
 
     # Save all results to a single file
-    all_results_path = os.path.join(RESULTS_DIR, "all_results.json")
+    all_results_path = os.path.join(TARGETED_PRUNING_DIR, "all_results.json")
     with open(all_results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"All results saved to {all_results_path}")
 
-    # Generate results table
-    print("\n" + "=" * 80)
-    print("TARGETED PRUNING EXPERIMENT RESULTS")
-    print("=" * 80)
+    # Generate and display summary table
+    summary_table = generate_summary_table(results)
+    print("\n" + "=" * 60)
+    print("TARGETED PRUNING EXPERIMENT SUMMARY")
+    print("=" * 60)
+    print(summary_table)
 
-    # Define the metrics to include in the table
-    table_metrics = ["WER", "CER", "RTF", "actual_sparsity"]
-
-    # Print table header
-    header = "| Configuration | WER | CER | RTF | Sparsity | Model Size (MB) |"
-    separator = (
-        "|"
-        + "-" * 15
-        + "|"
-        + "-" * 8
-        + "|"
-        + "-" * 8
-        + "|"
-        + "-" * 8
-        + "|"
-        + "-" * 10
-        + "|"
-        + "-" * 16
-        + "|"
-    )
-
-    print(header)
-    print(separator)
-
-    # Print baseline first
-    if "baseline" in results:
-        baseline = results["baseline"]
-        baseline_row = "| baseline | "
-        for metric in table_metrics:
-            if metric in baseline["metrics"]:
-                baseline_row += f"{baseline['metrics'][metric]:.4f} | "
-            elif metric == "actual_sparsity":
-                baseline_row += f"{baseline[metric]:.2f}% | "
-            else:
-                baseline_row += "N/A | "
-        baseline_row += f"{baseline['model_size_mb']:.2f} |"
-        print(baseline_row)
-
-    # Print 30% pruning results
-    print("\n| 30% Pruning | WER | CER | RTF | Sparsity | Model Size (MB) |")
-    print(separator)
-
-    for config_name in [c["name"] for c in pruning_configs if "30" in c["name"]]:
-        if config_name in results:
-            config_result = results[config_name]
-            row = f"| {config_name} | "
-            for metric in table_metrics:
-                if metric in config_result["metrics"]:
-                    row += f"{config_result['metrics'][metric]:.4f} | "
-                elif metric == "actual_sparsity":
-                    row += f"{config_result[metric]:.2f}% | "
-                else:
-                    row += "N/A | "
-            row += f"{config_result['model_size_mb']:.2f} |"
-            print(row)
-
-    # Print 40% pruning results
-    print("\n| 40% Pruning | WER | CER | RTF | Sparsity | Model Size (MB) |")
-    print(separator)
-
-    for config_name in [c["name"] for c in pruning_configs if "40" in c["name"]]:
-        if config_name in results:
-            config_result = results[config_name]
-            row = f"| {config_name} | "
-            for metric in table_metrics:
-                if metric in config_result["metrics"]:
-                    row += f"{config_result['metrics'][metric]:.4f} | "
-                elif metric == "actual_sparsity":
-                    row += f"{config_result[metric]:.2f}% | "
-                else:
-                    row += "N/A | "
-            row += f"{config_result['model_size_mb']:.2f} |"
-            print(row)
-
-    print("\nDetailed metrics saved to:", RESULTS_DIR)
+    # Save summary table to file
+    table_path = os.path.join(TARGETED_PRUNING_DIR, "summary_table.txt")
+    with open(table_path, "w") as f:
+        f.write(summary_table)
+    print(f"\nSummary table saved to {table_path}")
 
 
 if __name__ == "__main__":
