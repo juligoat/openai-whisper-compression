@@ -20,9 +20,7 @@ sns.set(style="whitegrid")
 
 # Create results directory
 RESULTS_DIR = "pruning/whisper_pruning_results"
-L1_PRUNING_DIR = os.path.join(
-    RESULTS_DIR, "l1_decoder_cross_attn_pruning"
-)  # Changed to indicate decoder cross-attention
+L1_PRUNING_DIR = os.path.join(RESULTS_DIR, "l1_conv_pruning")  # Modified for conv pruning
 PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
 MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
 
@@ -110,12 +108,12 @@ def calculate_model_gflops(model):
         float: Estimated GFLOPs
     """
     # Track FLOPs by module type
-    flops_by_type = {"encoder": 0, "decoder": 0, "decoder_cross_attn": 0, "other": 0}
+    flops_by_type = {"encoder": 0, "decoder": 0, "other": 0}
 
     total_params = 0
     non_zero_params = 0
 
-    # Analyze linear layers (where most computation happens)
+    # Analyze linear and convolutional layers (where most computation happens)
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
             if not hasattr(module, "weight"):
@@ -139,11 +137,68 @@ def calculate_model_gflops(model):
             if "encoder" in name:
                 flops_by_type["encoder"] += non_zero_ops
             elif "decoder" in name:
-                # Check if this is a cross-attention component in the decoder
-                if is_cross_attention_layer(name):
-                    flops_by_type["decoder_cross_attn"] += non_zero_ops
-                else:
-                    flops_by_type["decoder"] += non_zero_ops
+                flops_by_type["decoder"] += non_zero_ops
+            else:
+                flops_by_type["other"] += non_zero_ops
+
+            # Track parameter stats
+            total_params += weight.numel()
+            non_zero_params += (weight != 0).sum().item()
+
+        elif isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d)):
+            if not hasattr(module, "weight"):
+                continue
+
+            # Get conv dimensions
+            weight = module.weight
+
+            # For Conv1d, we need in_channels, out_channels, kernel_size
+            # For Conv2d, we need in_channels, out_channels, kernel_height, kernel_width
+
+            if isinstance(module, torch.nn.Conv1d):
+                out_channels, in_channels, kernel_size = weight.shape
+                # Each output element requires in_channels * kernel_size operations
+                # Output size depends on input size, stride, padding, etc.
+                # Simplification: just count operations per output element
+                ops_per_element = in_channels * kernel_size
+
+                # Estimate a reasonable output size (simplified)
+                # This is a rough approximation and will vary by actual input
+                estimated_output_elements = 1000 * out_channels  # Just a placeholder estimate
+
+                # Calculate sparsity
+                weight_sparsity = (
+                    torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
+                )
+
+                # Estimate FLOPs taking sparsity into account
+                non_zero_ops = (
+                    2 * ops_per_element * estimated_output_elements * (1 - weight_sparsity)
+                )
+
+            elif isinstance(module, torch.nn.Conv2d):
+                out_channels, in_channels, kernel_h, kernel_w = weight.shape
+                # Each output element requires in_channels * kernel_h * kernel_w operations
+                ops_per_element = in_channels * kernel_h * kernel_w
+
+                # Estimate a reasonable output size (simplified)
+                estimated_output_elements = 1000 * out_channels  # Just a placeholder estimate
+
+                # Calculate sparsity
+                weight_sparsity = (
+                    torch.sum(weight == 0).item() / weight.numel() if weight.numel() > 0 else 0
+                )
+
+                # Estimate FLOPs taking sparsity into account
+                non_zero_ops = (
+                    2 * ops_per_element * estimated_output_elements * (1 - weight_sparsity)
+                )
+
+            # Categorize by location in model
+            if "encoder" in name:
+                flops_by_type["encoder"] += non_zero_ops
+            elif "decoder" in name:
+                flops_by_type["decoder"] += non_zero_ops
             else:
                 flops_by_type["other"] += non_zero_ops
 
@@ -158,7 +213,7 @@ def calculate_model_gflops(model):
     avg_sequence_length = 25
     total_flops = (
         flops_by_type["encoder"]
-        + avg_sequence_length * (flops_by_type["decoder"] + flops_by_type["decoder_cross_attn"])
+        + avg_sequence_length * flops_by_type["decoder"]
         + flops_by_type["other"]
     )
 
@@ -394,10 +449,7 @@ def save_sparse_model(model, output_path):
         if "encoder" in name:
             param_type = "encoder"
         elif "decoder" in name:
-            if is_cross_attention_layer(name):
-                param_type = "decoder_cross_attn"
-            else:
-                param_type = "decoder_other"
+            param_type = "decoder"
 
         if "weight" in name:
             param_type += "_weight"
@@ -471,115 +523,29 @@ def save_sparse_model(model, output_path):
         return 0
 
 
-def is_cross_attention_layer(name):
-    """
-    Determine if a layer is part of the cross-attention mechanism in the decoder.
-
-    For Whisper model, cross-attention layers have 'encoder_attn' in their name.
-    This is the key fix for the script to correctly identify cross-attention components.
-
-    Args:
-        name: The name of the layer/parameter
-
-    Returns:
-        bool: True if this is a cross-attention layer in the decoder
-    """
-    # For Whisper model, the cross-attention components are explicitly named "encoder_attn"
-    # We need both conditions: it's in the decoder AND it's an encoder_attn component
-    if "decoder" in name and "encoder_attn" in name:
-        return True
-
-    return False
-
-
-def calculate_sparsity(model, component=None):
-    """
-    Calculate the sparsity percentage and parameter counts in the model.
-
-    Args:
-        model: The PyTorch model
-        component: Optional component to focus on ('encoder', 'decoder', 'decoder_cross_attn', or None for whole model)
-
-    Returns:
-        tuple: (sparsity percentage, total parameters, non-zero parameters)
-    """
-    total_params = 0
-    zero_params = 0
-
-    for name, param in model.named_parameters():
-        # Filter by component if specified
-        if (
-            component == "encoder"
-            and "encoder" not in name
-            or component == "decoder"
-            and "decoder" not in name
-            or component == "decoder_cross_attn"
-            and not (is_cross_attention_layer(name) and "decoder" in name)
-        ):
-            continue
-
-        if "weight" in name:  # Only consider weight parameters
-            total_params += param.numel()
-            zero_params += torch.sum(param == 0).item()
-
-    if total_params == 0:
-        return 0.0, 0, 0
-
-    sparsity = 100.0 * zero_params / total_params
-    non_zero_params = total_params - zero_params
-    return sparsity, total_params, non_zero_params
-
-
-def apply_l1_pruning(
-    model, amount=0.3, target_modules=None, make_permanent=False, decoder_cross_attention_only=False
-):
+def apply_l1_pruning(model, amount=0.3, target_modules=None, make_permanent=False):
     """
     Apply L1 unstructured pruning to a Whisper model.
 
     Args:
         model: The WhisperForConditionalGeneration model
         amount: Amount of weights to prune (0.3 = 30%)
-        target_modules: List of module types to prune (None = all Linear layers)
+        target_modules: List of module types to prune (None = all Conv layers)
         make_permanent: Whether to make pruning permanent
-        decoder_cross_attention_only: Whether to only prune cross-attention components in the decoder
 
     Returns:
         Pruned model
     """
-    # If no specific modules are targeted, default to all Linear layers
+    # If no specific modules are targeted, default to all Conv layers
     if target_modules is None:
-        target_modules = [torch.nn.Linear]
+        target_modules = [torch.nn.Conv1d, torch.nn.Conv2d]
 
     # Get parameters to prune based on target modules
     params_to_prune = []
-    cross_attn_modules = 0
-    decoder_modules = 0
-    total_modules = 0
-
     for name, module in model.named_modules():
         # Check if module is of target type
         if any(isinstance(module, m) for m in target_modules):
-            total_modules += 1
-
-            # Only include decoder cross-attention modules if decoder_cross_attention_only is True
-            if decoder_cross_attention_only:
-                # Use full module name path to check if it's a cross-attention layer
-                full_name = f"{name}"
-                if is_cross_attention_layer(full_name):
-                    if hasattr(module, "weight"):
-                        params_to_prune.append((module, "weight"))
-                        cross_attn_modules += 1
-
-                        # Debug information to understand which layers are being targeted
-                        print(
-                            f"Selected cross-attention layer: {full_name}, Shape: {module.weight.shape}"
-                        )
-            else:
-                # Regular pruning approach if not decoder_cross_attention_only
-                if hasattr(module, "weight"):
-                    params_to_prune.append((module, "weight"))
-                    if "decoder" in name:
-                        decoder_modules += 1
+            params_to_prune.append((module, "weight"))
 
     if not params_to_prune:
         print("Warning: No parameters found to prune! Check your target modules.")
@@ -588,11 +554,6 @@ def apply_l1_pruning(
     print(
         f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
     )
-
-    if decoder_cross_attention_only:
-        print(
-            f"Note: Only pruning decoder cross-attention modules ({cross_attn_modules} cross-attention modules out of {total_modules} total modules)"
-        )
 
     # Apply L1 unstructured pruning
     success_count = 0
@@ -631,9 +592,33 @@ def apply_l1_pruning(
     return model
 
 
-def load_whisper_model(
-    model_name, device, pruning_amount=None, make_permanent=True, decoder_cross_attention_only=False
-):
+def calculate_sparsity(model):
+    """
+    Calculate the sparsity percentage and parameter counts in the model.
+
+    Args:
+        model: The PyTorch model
+
+    Returns:
+        tuple: (sparsity percentage, total parameters, non-zero parameters)
+    """
+    total_params = 0
+    zero_params = 0
+
+    for name, param in model.named_parameters():
+        if "weight" in name:  # Only consider weight parameters
+            total_params += param.numel()
+            zero_params += torch.sum(param == 0).item()
+
+    if total_params == 0:
+        return 0.0, 0, 0
+
+    sparsity = 100.0 * zero_params / total_params
+    non_zero_params = total_params - zero_params
+    return sparsity, total_params, non_zero_params
+
+
+def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=True):
     """
     Load Whisper model and optionally apply pruning.
 
@@ -642,7 +627,6 @@ def load_whisper_model(
         device: Device to load the model to
         pruning_amount: Amount to prune (0.0 to 0.99) or None for no pruning
         make_permanent: Whether to make pruning permanent
-        decoder_cross_attention_only: Whether to only prune cross-attention components in the decoder
 
     Returns:
         WhisperForConditionalGeneration model
@@ -653,33 +637,16 @@ def load_whisper_model(
 
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
-            print(f"Applying L1 unstructured pruning with amount={pruning_amount}")
-            if decoder_cross_attention_only:
-                print("Note: Only pruning cross-attention components in the decoder")
-            model = apply_l1_pruning(
-                model,
-                amount=pruning_amount,
-                make_permanent=make_permanent,
-                decoder_cross_attention_only=decoder_cross_attention_only,
+            print(
+                f"Applying L1 unstructured pruning to convolutional layers with amount={pruning_amount}"
             )
+            model = apply_l1_pruning(model, amount=pruning_amount, make_permanent=make_permanent)
 
             # Calculate and print sparsity
-            overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
-            encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
-            decoder_sparsity, decoder_total, decoder_nonzero = calculate_sparsity(model, "decoder")
-            cross_attn_sparsity, cross_attn_total, cross_attn_nonzero = calculate_sparsity(
-                model, "decoder_cross_attn"
-            )
-
-            print(f"Overall model sparsity: {overall_sparsity:.2f}%")
-            print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
-            print(f"Decoder sparsity: {decoder_sparsity:.2f}%")
-            print(f"Decoder cross-attention sparsity: {cross_attn_sparsity:.2f}%")
+            sparsity, total_params, non_zero_params = calculate_sparsity(model)
+            print(f"Model sparsity after pruning: {sparsity:.2f}%")
             print(f"Total parameters: {total_params:,}")
             print(f"Non-zero parameters: {non_zero_params:,}")
-            print(
-                f"Decoder cross-attention parameters: {cross_attn_total:,} ({cross_attn_total/total_params*100:.2f}% of model)"
-            )
 
         # Move model to device
         model = model.to(device)
@@ -924,6 +891,7 @@ def evaluate_model(model, processor, dataset, metrics, memory_tracker, split, ba
     print(f"Total processing time: {total_processing_time:.2f} s")
     print(f"Total audio duration: {total_audio_duration:.2f} s")
 
+    # FIX: Return only two values to match the unpacking in the main function
     return scores, result
 
 
@@ -963,7 +931,7 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     return buffer.getbuffer().nbytes / (1024**2)
 
 
-def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=True):
+def create_plots(results, metric_names, plot_dir):
     """
     Create plots of metrics vs pruning percentage.
 
@@ -971,7 +939,6 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
         results: Dictionary of results
         metric_names: List of metric names to plot
         plot_dir: Directory to save plots
-        decoder_cross_attention_only: Whether this is decoder cross-attention-only pruning (True) or whole model pruning (False)
     """
     print("\nGenerating plots...")
 
@@ -989,14 +956,9 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
         if "baseline" in model_name:
             percent = 0
         else:
-            # Extract percentage from model name
+            # Extract percentage from model name (e.g., "l1_conv_10")
             try:
-                if decoder_cross_attention_only:
-                    # For decoder_cross_attn-only models (format: "l1_decoder_cross_attn_XX_clean" or "l1_decoder_cross_attn_XX_other")
-                    percent = int(model_name.split("_")[-2])
-                else:
-                    # For whole model pruning (format: "l1_XX_clean" or "l1_XX_other")
-                    percent = int(model_name.split("_")[1])
+                percent = int(model_name.split("_")[-1])
             except (IndexError, ValueError):
                 print(f"Skipping invalid model name: {model_name}")
                 continue
@@ -1029,9 +991,6 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
     # Sort pruning percentages
     pruning_percentages.sort()
 
-    # Title prefix for plots
-    pruning_type = "Decoder Cross-Attention Only" if decoder_cross_attention_only else "Whole Model"
-
     # Create individual plots for each metric
     for metric in metric_names:
         plt.figure(figsize=(10, 6))
@@ -1056,7 +1015,7 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
         # Add labels and title
         plt.xlabel("Pruning Percentage (%)")
         plt.ylabel(metric)
-        plt.title(f"{metric} vs {pruning_type} L1 Unstructured Pruning Percentage")
+        plt.title(f"{metric} vs L1 Unstructured Convolution Layer Pruning Percentage")
         plt.grid(True)
 
         # Only add legend if we have plot lines
@@ -1064,10 +1023,7 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
             plt.legend()
 
         # Save the plot
-        plot_path = os.path.join(
-            plot_dir,
-            f"{metric}_vs_{pruning_type.lower().replace('-', '_').replace(' ', '_')}_pruning.png",
-        )
+        plot_path = os.path.join(plot_dir, f"{metric}_vs_pruning.png")
         plt.savefig(plot_path, dpi=300, bbox_inches="tight")
         plt.close()
         print(f"Saved plot to {plot_path}")
@@ -1082,19 +1038,11 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
 
     for percent in pruning_percentages:
         # Find the model result with this percentage (prefer clean split)
-        if percent == 0:
-            model_name = "baseline_clean"
-            if model_name not in results:
-                model_name = "baseline_other"
-        else:
-            if decoder_cross_attention_only:
-                model_name = f"l1_decoder_cross_attn_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_decoder_cross_attn_{percent}_other"
-            else:
-                model_name = f"l1_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_{percent}_other"
+        model_name = f"l1_conv_{percent}_clean" if percent > 0 else "baseline_clean"
+        if model_name not in results and percent > 0:
+            model_name = f"l1_conv_{percent}_other"
+        if model_name not in results and percent == 0:
+            model_name = "baseline_other"
 
         if model_name in results:
             if "model_size_mb" in results[model_name]:
@@ -1138,15 +1086,12 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
 
     plt.xlabel("Pruning Percentage (%)")
     plt.ylabel("Model Size (MB)")
-    plt.title(f"Model Size vs {pruning_type} L1 Unstructured Pruning Percentage")
+    plt.title("Model Size vs L1 Unstructured Convolution Layer Pruning Percentage")
     plt.grid(True)
     plt.legend()
 
     # Save the plot
-    plot_path = os.path.join(
-        plot_dir,
-        f"model_size_vs_{pruning_type.lower().replace('-', '_').replace(' ', '_')}_pruning.png",
-    )
+    plot_path = os.path.join(plot_dir, "model_size_vs_pruning.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved plot to {plot_path}")
@@ -1159,19 +1104,11 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
 
     for percent in pruning_percentages:
         # Find the model result with this percentage (prefer clean split)
-        if percent == 0:
-            model_name = "baseline_clean"
-            if model_name not in results:
-                model_name = "baseline_other"
-        else:
-            if decoder_cross_attention_only:
-                model_name = f"l1_decoder_cross_attn_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_decoder_cross_attn_{percent}_other"
-            else:
-                model_name = f"l1_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_{percent}_other"
+        model_name = f"l1_conv_{percent}_clean" if percent > 0 else "baseline_clean"
+        if model_name not in results and percent > 0:
+            model_name = f"l1_conv_{percent}_other"
+        if model_name not in results and percent == 0:
+            model_name = "baseline_other"
 
         if model_name in results and "gflops" in results[model_name]:
             gflops_data.append((percent, results[model_name]["gflops"]))
@@ -1188,16 +1125,13 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
     plt.xlabel("Pruning Percentage (%)")
     plt.ylabel("GFLOPs")
     plt.title(
-        f"Computational Complexity (GFLOPs) vs {pruning_type} L1 Unstructured Pruning Percentage"
+        "Computational Complexity (GFLOPs) vs L1 Unstructured Convolution Layer Pruning Percentage"
     )
     plt.grid(True)
     plt.legend()
 
     # Save the plot
-    plot_path = os.path.join(
-        plot_dir,
-        f"gflops_vs_{pruning_type.lower().replace('-', '_').replace(' ', '_')}_pruning.png",
-    )
+    plot_path = os.path.join(plot_dir, "gflops_vs_pruning.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved plot to {plot_path}")
@@ -1211,19 +1145,11 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
 
     for percent in pruning_percentages:
         # Find the model result with this percentage (prefer clean split)
-        if percent == 0:
-            model_name = "baseline_clean"
-            if model_name not in results:
-                model_name = "baseline_other"
-        else:
-            if decoder_cross_attention_only:
-                model_name = f"l1_decoder_cross_attn_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_decoder_cross_attn_{percent}_other"
-            else:
-                model_name = f"l1_{percent}_clean"
-                if model_name not in results:
-                    model_name = f"l1_{percent}_other"
+        model_name = f"l1_conv_{percent}_clean" if percent > 0 else "baseline_clean"
+        if model_name not in results and percent > 0:
+            model_name = f"l1_conv_{percent}_other"
+        if model_name not in results and percent == 0:
+            model_name = "baseline_other"
 
         if model_name in results:
             if "total_parameters" in results[model_name]:
@@ -1253,15 +1179,12 @@ def create_plots(results, metric_names, plot_dir, decoder_cross_attention_only=T
 
     plt.xlabel("Pruning Percentage (%)")
     plt.ylabel("Parameters (millions)")
-    plt.title(f"Parameter Count vs {pruning_type} L1 Unstructured Pruning Percentage")
+    plt.title("Parameter Count vs L1 Unstructured Convolution Layer Pruning Percentage")
     plt.grid(True)
     plt.legend()
 
     # Save the plot
-    plot_path = os.path.join(
-        plot_dir,
-        f"parameters_vs_{pruning_type.lower().replace('-', '_').replace(' ', '_')}_pruning.png",
-    )
+    plot_path = os.path.join(plot_dir, "parameters_vs_pruning.png")
     plt.savefig(plot_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"Saved plot to {plot_path}")
@@ -1281,7 +1204,7 @@ def main():
         device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define the pruning percentages to test (0% to 50% in 10% increments for decoder-cross-attention-only)
+    # Define the pruning percentages to test (0% to 50%) - MODIFIED for convolution pruning
     pruning_percentages = [0, 10, 20, 30, 40, 50]
 
     # Load processor once - can be shared across models
@@ -1313,12 +1236,11 @@ def main():
         }
     }
 
-    # Add pruning configurations
+    # Add pruning configurations - MODIFIED for "l1_conv_" prefix
     for percent in pruning_percentages:
         if percent > 0:  # Skip 0% as it's already in baseline
-            model_configs[f"l1_decoder_cross_attn_{percent}"] = {
-                "pruning_amount": percent / 100,  # Convert percentage to fraction
-                "decoder_cross_attention_only": True,  # Only prune cross-attention components in the decoder
+            model_configs[f"l1_conv_{percent}"] = {
+                "pruning_amount": percent / 100  # Convert percentage to fraction
             }
 
     # Evaluate each configuration
@@ -1335,28 +1257,15 @@ def main():
             model = load_whisper_model(
                 model_name=original_model_name,
                 device=device,
-                pruning_amount=config.get("pruning_amount"),
+                pruning_amount=config["pruning_amount"],
                 make_permanent=True,
-                decoder_cross_attention_only=config.get("decoder_cross_attention_only", False),
             )
 
             # Calculate actual sparsity and parameter counts
-            overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
-            encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
-            decoder_sparsity, decoder_total, decoder_nonzero = calculate_sparsity(model, "decoder")
-            cross_attn_sparsity, cross_attn_total, cross_attn_nonzero = calculate_sparsity(
-                model, "decoder_cross_attn"
-            )
-
-            print(f"Actual model sparsity: {overall_sparsity:.2f}%")
-            print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
-            print(f"Decoder sparsity: {decoder_sparsity:.2f}%")
-            print(f"Decoder cross-attention sparsity: {cross_attn_sparsity:.2f}%")
+            sparsity, total_params, non_zero_params = calculate_sparsity(model)
+            print(f"Actual model sparsity: {sparsity:.2f}%")
             print(f"Total parameters: {total_params:,}")
             print(f"Non-zero parameters: {non_zero_params:,}")
-            print(
-                f"Decoder cross-attention parameters: {cross_attn_total:,} ({cross_attn_total/total_params*100:.2f}% of model)"
-            )
 
             # Calculate model GFLOPs
             gflops = calculate_model_gflops(model)
@@ -1373,7 +1282,7 @@ def main():
                 tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
                 try:
-                    # Evaluate the model
+                    # FIX: Unpack only two values from evaluate_model
                     scores, result = evaluate_model(
                         model=model,
                         processor=processor,
@@ -1391,10 +1300,7 @@ def main():
 
                         # Calculate theoretical size of a dense model with pruned weights removed
                         theoretical_dense_pruned_size = 0.0
-                        if (
-                            config.get("pruning_amount") is not None
-                            and config.get("pruning_amount") > 0
-                        ):
+                        if config["pruning_amount"] is not None and config["pruning_amount"] > 0:
                             # Calculate what the size would be if we removed zeros (without creating the model)
                             theoretical_dense_pruned_size = calculate_pruned_dense_size(
                                 model, pruning_threshold=0.0
@@ -1403,33 +1309,18 @@ def main():
                                 f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
                             )
 
-                        # Extract pruning percentage from model name
-                        if "baseline" in model_name:
-                            pruning_pct = 0
-                        else:
-                            try:
-                                pruning_pct = int(model_name.split("_")[-1])
-                            except:
-                                # Handle more complex model naming patterns
-                                pruning_pct = int(model_name.split("_")[-2])
-
                         # Build results dictionary
                         results[f"{model_name}_{split}"] = {
                             "metrics": scores,
                             "model_size_mb": model_size,
                             "model_type": model_name,
                             "gflops": gflops,  # Add GFLOPs to results
-                            "pruning_percentage": pruning_pct,
-                            "decoder_cross_attention_only": config.get(
-                                "decoder_cross_attention_only", False
-                            ),  # Add decoder_cross_attention_only flag
-                            "actual_sparsity": overall_sparsity,
-                            "encoder_sparsity": encoder_sparsity,
-                            "decoder_sparsity": decoder_sparsity,
-                            "cross_attn_sparsity": cross_attn_sparsity,
+                            "pruning_percentage": 0
+                            if "baseline" in model_name
+                            else int(model_name.split("_")[-1]),
+                            "actual_sparsity": sparsity,
                             "total_parameters": total_params,  # Add total parameter count
                             "non_zero_parameters": non_zero_params,  # Add non-zero parameter count
-                            "cross_attn_parameters": cross_attn_total,  # Add cross-attention parameter count
                             "theoretical_dense_pruned_size_mb": theoretical_dense_pruned_size,  # Add theoretical size
                         }
 
@@ -1483,7 +1374,7 @@ def main():
         json.dump(results, f, indent=2)
     print(f"All results saved to {all_results_path}")
 
-    # Create a safe list of metrics for plotting
+    # FIX: Use a safer list of metrics for plotting
     safe_metrics = []
     for metric in ["WER", "CER", "RTF", "avg_cpu_percent", "peak_ram_gb", "gflops"]:
         # Check if at least one result has this metric
@@ -1498,16 +1389,11 @@ def main():
     print(f"Plotting the following metrics: {safe_metrics}")
 
     # Create plots with the validated metrics
-    create_plots(
-        results=results,
-        metric_names=safe_metrics,
-        plot_dir=PLOTS_DIR,
-        decoder_cross_attention_only=True,
-    )
+    create_plots(results=results, metric_names=safe_metrics, plot_dir=PLOTS_DIR)
 
     # Print summary
     print("\n" + "=" * 60)
-    print("L1 UNSTRUCTURED DECODER CROSS-ATTENTION ONLY PRUNING EXPERIMENT SUMMARY")
+    print("L1 UNSTRUCTURED CONVOLUTION LAYER PRUNING EXPERIMENT SUMMARY")
     print("=" * 60)
 
     print("\nBaseline (0% pruning):")
@@ -1521,12 +1407,12 @@ def main():
         print(f"  Total Parameters: {baseline['total_parameters']:,}")
         print(f"  Non-zero Parameters: {baseline['non_zero_parameters']:,}")
 
-    print("\nResults for different decoder cross-attention pruning percentages:")
+    print("\nResults for different pruning percentages:")
     for percent in pruning_percentages:
         if percent == 0:
             continue
 
-        model_key = f"l1_decoder_cross_attn_{percent}_clean"
+        model_key = f"l1_conv_{percent}_clean"
         if model_key in results:
             result = results[model_key]
 
@@ -1564,7 +1450,7 @@ def main():
                 if "non_zero_parameters" in result and "non_zero_parameters" in baseline:
                     param_change = f"{(result['non_zero_parameters'] - baseline['non_zero_parameters']) / baseline['non_zero_parameters'] * 100:+.2f}%"
 
-            print(f"\n{percent}% decoder cross-attention pruning:")
+            print(f"\n{percent}% pruning:")
             if "WER" in result["metrics"]:
                 print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
             if "CER" in result["metrics"]:
@@ -1585,36 +1471,16 @@ def main():
             if "gflops" in result:
                 print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
             if "actual_sparsity" in result:
-                print(f"  Overall Sparsity: {result['actual_sparsity']:.2f}%")
-            if "cross_attn_sparsity" in result:
-                print(f"  Decoder Cross-Attention Sparsity: {result['cross_attn_sparsity']:.2f}%")
+                print(f"  Actual Sparsity: {result['actual_sparsity']:.2f}%")
             if "total_parameters" in result:
                 print(f"  Total Parameters: {result['total_parameters']:,}")
             if "non_zero_parameters" in result:
                 print(f"  Non-zero Parameters: {result['non_zero_parameters']:,} ({param_change})")
-            if "cross_attn_parameters" in result:
-                print(
-                    f"  Decoder Cross-Attention Parameters: {result['cross_attn_parameters']:,} ({result['cross_attn_parameters']/result['total_parameters']*100:.2f}% of model)"
-                )
 
     print("\nPlots saved to:", PLOTS_DIR)
     print("Sparse models saved to:", MODELS_DIR)
     print("Detailed metrics saved to:", L1_PRUNING_DIR)
-    print(
-        "\nNote: This experiment focused on pruning only the cross-attention components in the decoder of the Whisper model"
-    )
 
 
 if __name__ == "__main__":
-    # Print experiment details
-    print("=" * 80)
-    print("WHISPER DECODER CROSS-ATTENTION ONLY L1 UNSTRUCTURED PRUNING EXPERIMENT")
-    print("=" * 80)
-    print("This experiment applies L1 unstructured pruning ONLY to the cross-attention components")
-    print("in the decoder part of the Whisper model.")
-    print("Pruning percentages: 0%, 10%, 20%, 30%, 40%, 50%")
-    print("Model: openai/whisper-small")
-    print("Test datasets: LibriSpeech test-clean and test-other")
-    print("=" * 80)
-
     main()

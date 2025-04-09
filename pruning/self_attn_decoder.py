@@ -21,8 +21,8 @@ sns.set(style="whitegrid")
 # Create results directory
 RESULTS_DIR = "pruning/whisper_pruning_results"
 L1_PRUNING_DIR = os.path.join(
-    RESULTS_DIR, "l1_decoder_attn_pruning"
-)  # Changed to indicate decoder attention-only
+    RESULTS_DIR, "l1_decoder_self_attn_pruning"
+)  # Changed to be more specific with self-attention
 PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
 MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
 
@@ -110,7 +110,13 @@ def calculate_model_gflops(model):
         float: Estimated GFLOPs
     """
     # Track FLOPs by module type
-    flops_by_type = {"encoder": 0, "decoder": 0, "decoder_attn": 0, "other": 0}
+    flops_by_type = {
+        "encoder": 0,
+        "decoder": 0,
+        "decoder_self_attn": 0,
+        "decoder_cross_attn": 0,
+        "other": 0,
+    }
 
     total_params = 0
     non_zero_params = 0
@@ -140,8 +146,10 @@ def calculate_model_gflops(model):
                 flops_by_type["encoder"] += non_zero_ops
             elif "decoder" in name:
                 # Check if this is an attention component in the decoder
-                if is_attention_layer(name):
-                    flops_by_type["decoder_attn"] += non_zero_ops
+                if "self_attn" in name and "encoder_attn" not in name:
+                    flops_by_type["decoder_self_attn"] += non_zero_ops
+                elif "encoder_attn" in name:
+                    flops_by_type["decoder_cross_attn"] += non_zero_ops
                 else:
                     flops_by_type["decoder"] += non_zero_ops
             else:
@@ -158,7 +166,12 @@ def calculate_model_gflops(model):
     avg_sequence_length = 25
     total_flops = (
         flops_by_type["encoder"]
-        + avg_sequence_length * (flops_by_type["decoder"] + flops_by_type["decoder_attn"])
+        + avg_sequence_length
+        * (
+            flops_by_type["decoder"]
+            + flops_by_type["decoder_self_attn"]
+            + flops_by_type["decoder_cross_attn"]
+        )
         + flops_by_type["other"]
     )
 
@@ -394,8 +407,10 @@ def save_sparse_model(model, output_path):
         if "encoder" in name:
             param_type = "encoder"
         elif "decoder" in name:
-            if is_attention_layer(name):
-                param_type = "decoder_attn"
+            if "self_attn" in name and "encoder_attn" not in name:
+                param_type = "decoder_self_attn"
+            elif "encoder_attn" in name:
+                param_type = "decoder_cross_attn"
             else:
                 param_type = "decoder_other"
 
@@ -475,47 +490,26 @@ def is_attention_layer(name):
     """
     Determine if a layer is part of the self-attention mechanism in the decoder.
 
-    In Transformer-based models like Whisper, the self-attention typically includes
-    query, key, value projections and output projection.
-
     Args:
         name: The name of the layer/parameter
 
     Returns:
-        bool: True if this is an attention layer in the decoder, False otherwise
+        bool: True if this is a self-attention layer in the decoder, False otherwise
     """
-    # Determine if we're looking at a decoder component
-    is_decoder = "decoder" in name
-
-    if not is_decoder:
+    # Step 1: Verify this is a decoder component
+    if "decoder" not in name:
         return False
 
-    # In transformer models, attention components typically include these terms
-    attention_indicators = [
-        # Common names for attention components
-        "attn",
-        "attention",  # General attention terms
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "out_proj",  # Projection matrices
-        "query",
-        "key",
-        "value",  # QKV naming
-        "self_attn",
-        "mha",
-        "multihead",  # Self-attention and multihead terms
-        "qkv",  # Combined QKV projection
-    ]
+    # Step 2: Must be self-attention, not cross-attention
+    if "self_attn" not in name or "encoder_attn" in name:
+        return False
 
-    # Check if any attention indicator is in the name
-    if any(indicator in name.lower() for indicator in attention_indicators):
-        # Ensure it's not a FFN component
-        ffn_indicators = ["ffn", "feed_forward", "fc1", "fc2", "mlp", "linear1", "linear2"]
-        if not any(ffn_term in name.lower() for ffn_term in ffn_indicators):
-            return True
+    # Step 3: Must be one of the projection matrices
+    projection_matrices = ["q_proj", "k_proj", "v_proj", "out_proj"]
+    if not any(proj in name for proj in projection_matrices):
+        return False
 
-    return False
+    return True
 
 
 def calculate_sparsity(model, component=None):
@@ -524,7 +518,7 @@ def calculate_sparsity(model, component=None):
 
     Args:
         model: The PyTorch model
-        component: Optional component to focus on ('encoder', 'decoder', 'decoder_attn', or None for whole model)
+        component: Optional component to focus on ('encoder', 'decoder', 'decoder_self_attn', or None for whole model)
 
     Returns:
         tuple: (sparsity percentage, total parameters, non-zero parameters)
@@ -539,7 +533,7 @@ def calculate_sparsity(model, component=None):
             and "encoder" not in name
             or component == "decoder"
             and "decoder" not in name
-            or component == "decoder_attn"
+            or component == "decoder_self_attn"
             and not (is_attention_layer(name) and "decoder" in name)
         ):
             continue
@@ -557,7 +551,7 @@ def calculate_sparsity(model, component=None):
 
 
 def apply_l1_pruning(
-    model, amount=0.3, target_modules=None, make_permanent=False, decoder_attention_only=False
+    model, amount=0.3, target_modules=None, make_permanent=False, decoder_self_attn_only=False
 ):
     """
     Apply L1 unstructured pruning to a Whisper model.
@@ -567,7 +561,7 @@ def apply_l1_pruning(
         amount: Amount of weights to prune (0.3 = 30%)
         target_modules: List of module types to prune (None = all Linear layers)
         make_permanent: Whether to make pruning permanent
-        decoder_attention_only: Whether to only prune attention components in the decoder
+        decoder_self_attn_only: Whether to only prune self-attention components in the decoder
 
     Returns:
         Pruned model
@@ -579,7 +573,6 @@ def apply_l1_pruning(
     # Get parameters to prune based on target modules
     params_to_prune = []
     attn_modules = 0
-    decoder_modules = 0
     total_modules = 0
 
     for name, module in model.named_modules():
@@ -587,24 +580,22 @@ def apply_l1_pruning(
         if any(isinstance(module, m) for m in target_modules):
             total_modules += 1
 
-            # Only include decoder attention modules if decoder_attention_only is True
-            if decoder_attention_only:
+            # Only include decoder self-attention modules if decoder_self_attn_only is True
+            if decoder_self_attn_only:
                 # Use full module name path to check if it's an attention layer
                 full_name = f"{name}"
-                if "decoder" in full_name and is_attention_layer(full_name):
+                if is_attention_layer(full_name):
                     params_to_prune.append((module, "weight"))
                     attn_modules += 1
 
                     # Debug information to understand which layers are being targeted
                     if hasattr(module, "weight"):
                         print(
-                            f"Selected attention layer: {full_name}, Shape: {module.weight.shape}"
+                            f"Selected self-attention layer: {full_name}, Shape: {module.weight.shape}"
                         )
             else:
-                # Regular pruning approach if not decoder_attention_only
+                # Regular pruning approach if not decoder_self_attn_only
                 params_to_prune.append((module, "weight"))
-                if "decoder" in name:
-                    decoder_modules += 1
 
     if not params_to_prune:
         print("Warning: No parameters found to prune! Check your target modules.")
@@ -614,9 +605,9 @@ def apply_l1_pruning(
         f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
     )
 
-    if decoder_attention_only:
+    if decoder_self_attn_only:
         print(
-            f"Note: Only pruning decoder attention modules ({attn_modules} attention modules out of {total_modules} total modules)"
+            f"Note: Only pruning decoder self-attention modules ({attn_modules} attention modules out of {total_modules} total modules)"
         )
 
     # Apply L1 unstructured pruning
@@ -657,7 +648,7 @@ def apply_l1_pruning(
 
 
 def load_whisper_model(
-    model_name, device, pruning_amount=None, make_permanent=True, decoder_attention_only=False
+    model_name, device, pruning_amount=None, make_permanent=True, decoder_self_attn_only=False
 ):
     """
     Load Whisper model and optionally apply pruning.
@@ -667,7 +658,7 @@ def load_whisper_model(
         device: Device to load the model to
         pruning_amount: Amount to prune (0.0 to 0.99) or None for no pruning
         make_permanent: Whether to make pruning permanent
-        decoder_attention_only: Whether to only prune attention components in the decoder
+        decoder_self_attn_only: Whether to only prune self-attention components in the decoder
 
     Returns:
         WhisperForConditionalGeneration model
@@ -679,29 +670,29 @@ def load_whisper_model(
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
             print(f"Applying L1 unstructured pruning with amount={pruning_amount}")
-            if decoder_attention_only:
+            if decoder_self_attn_only:
                 print("Note: Only pruning self-attention components in the decoder")
             model = apply_l1_pruning(
                 model,
                 amount=pruning_amount,
                 make_permanent=make_permanent,
-                decoder_attention_only=decoder_attention_only,
+                decoder_self_attn_only=decoder_self_attn_only,
             )
 
             # Calculate and print sparsity
             overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
             encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
             decoder_sparsity, decoder_total, decoder_nonzero = calculate_sparsity(model, "decoder")
-            attn_sparsity, attn_total, attn_nonzero = calculate_sparsity(model, "decoder_attn")
+            attn_sparsity, attn_total, attn_nonzero = calculate_sparsity(model, "decoder_self_attn")
 
             print(f"Overall model sparsity: {overall_sparsity:.2f}%")
             print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
             print(f"Decoder sparsity: {decoder_sparsity:.2f}%")
-            print(f"Decoder attention sparsity: {attn_sparsity:.2f}%")
+            print(f"Decoder self-attention sparsity: {attn_sparsity:.2f}%")
             print(f"Total parameters: {total_params:,}")
             print(f"Non-zero parameters: {non_zero_params:,}")
             print(
-                f"Decoder attention parameters: {attn_total:,} ({attn_total/total_params*100:.2f}% of model)"
+                f"Decoder self-attention parameters: {attn_total:,} ({attn_total/total_params*100:.2f}% of model)"
             )
 
         # Move model to device
@@ -987,7 +978,7 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     return buffer.getbuffer().nbytes / (1024**2)
 
 
-def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
+def create_plots(results, metric_names, plot_dir, decoder_self_attn_only=True):
     """
     Create plots of metrics vs pruning percentage.
 
@@ -995,7 +986,7 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
         results: Dictionary of results
         metric_names: List of metric names to plot
         plot_dir: Directory to save plots
-        decoder_attention_only: Whether this is decoder attention-only pruning (True) or whole model pruning (False)
+        decoder_self_attn_only: Whether this is decoder self-attention-only pruning (True) or whole model pruning (False)
     """
     print("\nGenerating plots...")
 
@@ -1015,8 +1006,8 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
         else:
             # Extract percentage from model name
             try:
-                if decoder_attention_only:
-                    # For decoder_attn-only models (format: "l1_decoder_attn_XX_clean" or "l1_decoder_attn_XX_other")
+                if decoder_self_attn_only:
+                    # For decoder_self_attn-only models (format: "l1_decoder_self_attn_XX_clean" or "l1_decoder_self_attn_XX_other")
                     percent = int(model_name.split("_")[-2])
                 else:
                     # For whole model pruning (format: "l1_XX_clean" or "l1_XX_other")
@@ -1054,7 +1045,7 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
     pruning_percentages.sort()
 
     # Title prefix for plots
-    pruning_type = "Decoder Self-Attention Only" if decoder_attention_only else "Whole Model"
+    pruning_type = "Decoder Self-Attention Only" if decoder_self_attn_only else "Whole Model"
 
     # Create individual plots for each metric
     for metric in metric_names:
@@ -1111,10 +1102,10 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
             if model_name not in results:
                 model_name = "baseline_other"
         else:
-            if decoder_attention_only:
-                model_name = f"l1_decoder_attn_{percent}_clean"
+            if decoder_self_attn_only:
+                model_name = f"l1_decoder_self_attn_{percent}_clean"
                 if model_name not in results:
-                    model_name = f"l1_decoder_attn_{percent}_other"
+                    model_name = f"l1_decoder_self_attn_{percent}_other"
             else:
                 model_name = f"l1_{percent}_clean"
                 if model_name not in results:
@@ -1188,10 +1179,10 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
             if model_name not in results:
                 model_name = "baseline_other"
         else:
-            if decoder_attention_only:
-                model_name = f"l1_decoder_attn_{percent}_clean"
+            if decoder_self_attn_only:
+                model_name = f"l1_decoder_self_attn_{percent}_clean"
                 if model_name not in results:
-                    model_name = f"l1_decoder_attn_{percent}_other"
+                    model_name = f"l1_decoder_self_attn_{percent}_other"
             else:
                 model_name = f"l1_{percent}_clean"
                 if model_name not in results:
@@ -1240,10 +1231,10 @@ def create_plots(results, metric_names, plot_dir, decoder_attention_only=True):
             if model_name not in results:
                 model_name = "baseline_other"
         else:
-            if decoder_attention_only:
-                model_name = f"l1_decoder_attn_{percent}_clean"
+            if decoder_self_attn_only:
+                model_name = f"l1_decoder_self_attn_{percent}_clean"
                 if model_name not in results:
-                    model_name = f"l1_decoder_attn_{percent}_other"
+                    model_name = f"l1_decoder_self_attn_{percent}_other"
             else:
                 model_name = f"l1_{percent}_clean"
                 if model_name not in results:
@@ -1305,7 +1296,7 @@ def main():
         device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define the pruning percentages to test (0% to 50% in 10% increments for decoder-attention-only)
+    # Define the pruning percentages to test (0% to 50% in 10% increments for decoder-self-attention-only)
     pruning_percentages = [0, 10, 20, 30, 40, 50]
 
     # Load processor once - can be shared across models
@@ -1340,9 +1331,9 @@ def main():
     # Add pruning configurations
     for percent in pruning_percentages:
         if percent > 0:  # Skip 0% as it's already in baseline
-            model_configs[f"l1_decoder_attn_{percent}"] = {
+            model_configs[f"l1_decoder_self_attn_{percent}"] = {
                 "pruning_amount": percent / 100,  # Convert percentage to fraction
-                "decoder_attention_only": True,  # Only prune attention components in the decoder
+                "decoder_self_attn_only": True,  # Only prune self-attention components in the decoder
             }
 
     # Evaluate each configuration
@@ -1361,23 +1352,23 @@ def main():
                 device=device,
                 pruning_amount=config.get("pruning_amount"),
                 make_permanent=True,
-                decoder_attention_only=config.get("decoder_attention_only", False),
+                decoder_self_attn_only=config.get("decoder_self_attn_only", False),
             )
 
             # Calculate actual sparsity and parameter counts
             overall_sparsity, total_params, non_zero_params = calculate_sparsity(model)
             encoder_sparsity, encoder_total, encoder_nonzero = calculate_sparsity(model, "encoder")
             decoder_sparsity, decoder_total, decoder_nonzero = calculate_sparsity(model, "decoder")
-            attn_sparsity, attn_total, attn_nonzero = calculate_sparsity(model, "decoder_attn")
+            attn_sparsity, attn_total, attn_nonzero = calculate_sparsity(model, "decoder_self_attn")
 
             print(f"Actual model sparsity: {overall_sparsity:.2f}%")
             print(f"Encoder sparsity: {encoder_sparsity:.2f}%")
             print(f"Decoder sparsity: {decoder_sparsity:.2f}%")
-            print(f"Decoder attention sparsity: {attn_sparsity:.2f}%")
+            print(f"Decoder self-attention sparsity: {attn_sparsity:.2f}%")
             print(f"Total parameters: {total_params:,}")
             print(f"Non-zero parameters: {non_zero_params:,}")
             print(
-                f"Decoder attention parameters: {attn_total:,} ({attn_total/total_params*100:.2f}% of model)"
+                f"Decoder self-attention parameters: {attn_total:,} ({attn_total/total_params*100:.2f}% of model)"
             )
 
             # Calculate model GFLOPs
@@ -1442,9 +1433,9 @@ def main():
                             "model_type": model_name,
                             "gflops": gflops,  # Add GFLOPs to results
                             "pruning_percentage": pruning_pct,
-                            "decoder_attention_only": config.get(
-                                "decoder_attention_only", False
-                            ),  # Add decoder_attention_only flag
+                            "decoder_self_attn_only": config.get(
+                                "decoder_self_attn_only", False
+                            ),  # Add decoder_self_attn_only flag
                             "actual_sparsity": overall_sparsity,
                             "encoder_sparsity": encoder_sparsity,
                             "decoder_sparsity": decoder_sparsity,
@@ -1521,7 +1512,7 @@ def main():
 
     # Create plots with the validated metrics
     create_plots(
-        results=results, metric_names=safe_metrics, plot_dir=PLOTS_DIR, decoder_attention_only=True
+        results=results, metric_names=safe_metrics, plot_dir=PLOTS_DIR, decoder_self_attn_only=True
     )
 
     # Print summary
@@ -1540,12 +1531,12 @@ def main():
         print(f"  Total Parameters: {baseline['total_parameters']:,}")
         print(f"  Non-zero Parameters: {baseline['non_zero_parameters']:,}")
 
-    print("\nResults for different decoder attention pruning percentages:")
+    print("\nResults for different decoder self-attention pruning percentages:")
     for percent in pruning_percentages:
         if percent == 0:
             continue
 
-        model_key = f"l1_decoder_attn_{percent}_clean"
+        model_key = f"l1_decoder_self_attn_{percent}_clean"
         if model_key in results:
             result = results[model_key]
 
@@ -1606,14 +1597,14 @@ def main():
             if "actual_sparsity" in result:
                 print(f"  Overall Sparsity: {result['actual_sparsity']:.2f}%")
             if "attn_sparsity" in result:
-                print(f"  Decoder Attention Sparsity: {result['attn_sparsity']:.2f}%")
+                print(f"  Decoder Self-Attention Sparsity: {result['attn_sparsity']:.2f}%")
             if "total_parameters" in result:
                 print(f"  Total Parameters: {result['total_parameters']:,}")
             if "non_zero_parameters" in result:
                 print(f"  Non-zero Parameters: {result['non_zero_parameters']:,} ({param_change})")
             if "attn_parameters" in result:
                 print(
-                    f"  Decoder Attention Parameters: {result['attn_parameters']:,} ({result['attn_parameters']/result['total_parameters']*100:.2f}% of model)"
+                    f"  Decoder Self-Attention Parameters: {result['attn_parameters']:,} ({result['attn_parameters']/result['total_parameters']*100:.2f}% of model)"
                 )
 
     print("\nPlots saved to:", PLOTS_DIR)

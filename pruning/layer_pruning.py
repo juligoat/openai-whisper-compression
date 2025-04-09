@@ -1047,7 +1047,7 @@ def main():
     # Define the targeted pruning configurations
     sections = ["early", "middle", "late"]
     components = ["encoder", "decoder"]
-    pruning_percentages = [30, 40]  # Only 30% and 40% sparsity
+    pruning_percentages = [30, 40, 50]  # Only 30%, 40% and 50% sparsity
 
     targeted_configs = []
 

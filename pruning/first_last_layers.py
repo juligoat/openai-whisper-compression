@@ -882,15 +882,15 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
 
 def create_summary_table(results):
     """
-    Create a summary table of results comparing baseline, 30%, and 40% pruning.
+    Create a summary table of results comparing baseline, 30%, 40%, and 50% pruning.
 
     Args:
         results: Dictionary of results
     """
     # Format for pretty printing
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 120)
     print("SUMMARY TABLE: SELECTIVE LAYER PRUNING EXPERIMENT")
-    print("=" * 100)
+    print("=" * 120)
 
     # Define metrics to include in summary
     metrics = [
@@ -905,18 +905,29 @@ def create_summary_table(results):
     ]
 
     # Print header
-    header = ["Metric", "Baseline", "30% Pruning", "40% Pruning", "Change 30%", "Change 40%"]
+    header = [
+        "Metric",
+        "Baseline",
+        "30% Pruning",
+        "40% Pruning",
+        "50% Pruning",
+        "Change 30%",
+        "Change 40%",
+        "Change 50%",
+    ]
 
     # Format header
     print(
-        f"{header[0]:<25} {header[1]:<15} {header[2]:<15} {header[3]:<15} {header[4]:<15} {header[5]:<15}"
+        f"{header[0]:<25} {header[1]:<12} {header[2]:<12} {header[3]:<12} {header[4]:<12} "
+        f"{header[5]:<12} {header[6]:<12} {header[7]:<12}"
     )
-    print("-" * 100)
+    print("-" * 120)
 
     # Get model names
     baseline_key = "baseline_clean"
     p30_key = "selective_p30_clean"
     p40_key = "selective_p40_clean"
+    p50_key = "selective_p50_clean"
 
     # Process each metric
     for metric in metrics:
@@ -939,56 +950,127 @@ def create_summary_table(results):
         else:
             row.append("N/A")
 
-        # Get 30% pruning value and calculate change
+        # Get 30% pruning value
         if p30_key in results:
             if metric in ["WER", "CER", "RTF"]:
                 p30_val = results[p30_key]["metrics"].get(metric, "N/A")
             else:
                 p30_val = results[p30_key].get(metric, "N/A")
 
-            if isinstance(p30_val, (int, float)) and isinstance(baseline_val, (int, float)):
+            if isinstance(p30_val, (int, float)):
                 if metric == "non_zero_parameters":
                     row.append(f"{p30_val:,}")
-                    change = 100.0 * (p30_val - baseline_val) / baseline_val
-                    row.append(f"{change:+.2f}%")
                 else:
                     row.append(f"{p30_val:.4f}")
-                    change = 100.0 * (p30_val - baseline_val) / baseline_val
-                    row.append(f"{change:+.2f}%")
             else:
                 row.append(str(p30_val))
-                row.append("N/A")
         else:
             row.append("N/A")
-            row.append("N/A")
 
-        # Get 40% pruning value and calculate change
+        # Get 40% pruning value
         if p40_key in results:
             if metric in ["WER", "CER", "RTF"]:
                 p40_val = results[p40_key]["metrics"].get(metric, "N/A")
             else:
                 p40_val = results[p40_key].get(metric, "N/A")
 
-            if isinstance(p40_val, (int, float)) and isinstance(baseline_val, (int, float)):
+            if isinstance(p40_val, (int, float)):
                 if metric == "non_zero_parameters":
                     row.append(f"{p40_val:,}")
-                    change = 100.0 * (p40_val - baseline_val) / baseline_val
-                    row.append(f"{change:+.2f}%")
                 else:
                     row.append(f"{p40_val:.4f}")
-                    change = 100.0 * (p40_val - baseline_val) / baseline_val
-                    row.append(f"{change:+.2f}%")
             else:
                 row.append(str(p40_val))
+        else:
+            row.append("N/A")
+
+        # Get 50% pruning value
+        if p50_key in results:
+            if metric in ["WER", "CER", "RTF"]:
+                p50_val = results[p50_key]["metrics"].get(metric, "N/A")
+            else:
+                p50_val = results[p50_key].get(metric, "N/A")
+
+            if isinstance(p50_val, (int, float)):
+                if metric == "non_zero_parameters":
+                    row.append(f"{p50_val:,}")
+                else:
+                    row.append(f"{p50_val:.4f}")
+            else:
+                row.append(str(p50_val))
+        else:
+            row.append("N/A")
+
+        # Calculate changes for 30%
+        if baseline_key in results and p30_key in results:
+            if metric in ["WER", "CER", "RTF"]:
+                baseline_val = results[baseline_key]["metrics"].get(metric, None)
+                p30_val = results[p30_key]["metrics"].get(metric, None)
+            else:
+                baseline_val = results[baseline_key].get(metric, None)
+                p30_val = results[p30_key].get(metric, None)
+
+            if (
+                isinstance(baseline_val, (int, float))
+                and isinstance(p30_val, (int, float))
+                and baseline_val != 0
+            ):
+                change = 100.0 * (p30_val - baseline_val) / baseline_val
+                row.append(f"{change:+.2f}%")
+            else:
                 row.append("N/A")
         else:
             row.append("N/A")
+
+        # Calculate changes for 40%
+        if baseline_key in results and p40_key in results:
+            if metric in ["WER", "CER", "RTF"]:
+                baseline_val = results[baseline_key]["metrics"].get(metric, None)
+                p40_val = results[p40_key]["metrics"].get(metric, None)
+            else:
+                baseline_val = results[baseline_key].get(metric, None)
+                p40_val = results[p40_key].get(metric, None)
+
+            if (
+                isinstance(baseline_val, (int, float))
+                and isinstance(p40_val, (int, float))
+                and baseline_val != 0
+            ):
+                change = 100.0 * (p40_val - baseline_val) / baseline_val
+                row.append(f"{change:+.2f}%")
+            else:
+                row.append("N/A")
+        else:
+            row.append("N/A")
+
+        # Calculate changes for 50%
+        if baseline_key in results and p50_key in results:
+            if metric in ["WER", "CER", "RTF"]:
+                baseline_val = results[baseline_key]["metrics"].get(metric, None)
+                p50_val = results[p50_key]["metrics"].get(metric, None)
+            else:
+                baseline_val = results[baseline_key].get(metric, None)
+                p50_val = results[p50_key].get(metric, None)
+
+            if (
+                isinstance(baseline_val, (int, float))
+                and isinstance(p50_val, (int, float))
+                and baseline_val != 0
+            ):
+                change = 100.0 * (p50_val - baseline_val) / baseline_val
+                row.append(f"{change:+.2f}%")
+            else:
+                row.append("N/A")
+        else:
             row.append("N/A")
 
         # Print row
-        print(f"{row[0]:<25} {row[1]:<15} {row[2]:<15} {row[3]:<15} {row[4]:<15} {row[5]:<15}")
+        print(
+            f"{row[0]:<25} {row[1]:<12} {row[2]:<12} {row[3]:<12} {row[4]:<12} "
+            f"{row[5]:<12} {row[6]:<12} {row[7]:<12}"
+        )
 
-    print("=" * 100)
+    print("=" * 120)
 
 
 def main():
@@ -1005,8 +1087,8 @@ def main():
         device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define the pruning percentages to test (only 30% and 40%)
-    pruning_percentages = [0.3, 0.4]
+    # Define the pruning percentages to test (30%, 40%, and 50%)
+    pruning_percentages = [0.3, 0.4, 0.5]
 
     # Load processor once - can be shared across models
     processor = WhisperProcessor.from_pretrained(original_model_name)
