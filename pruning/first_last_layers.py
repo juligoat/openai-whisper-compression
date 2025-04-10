@@ -15,7 +15,7 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 # Create results directory
 RESULTS_DIR = "pruning/whisper_pruning_results"
-SELECTIVE_PRUNING_DIR = os.path.join(RESULTS_DIR, "selective_pruning")
+SELECTIVE_PRUNING_DIR = os.path.join(RESULTS_DIR, "individual_layer_pruning")
 MODELS_DIR = os.path.join(SELECTIVE_PRUNING_DIR, "models")
 
 for directory in [RESULTS_DIR, SELECTIVE_PRUNING_DIR, MODELS_DIR]:
@@ -456,20 +456,19 @@ def save_sparse_model(model, output_path):
         return 0
 
 
-def apply_selective_l1_pruning(model, amount=0.3, make_permanent=False):
+def apply_targeted_layer_pruning(model, target="encoder_first", amount=0.3, make_permanent=False):
     """
-    Apply L1 unstructured pruning to only the first and last layers of encoder and decoder.
+    Apply L1 unstructured pruning to a specific target layer only.
 
     Args:
         model: The WhisperForConditionalGeneration model
+        target: Which layer to prune ("encoder_first", "encoder_last", "decoder_first", "decoder_last")
         amount: Amount of weights to prune (0.3 = 30%)
         make_permanent: Whether to make pruning permanent
 
     Returns:
         Pruned model
     """
-    # Identify first and last layers of encoder and decoder
-    first_last_layers = []
     encoder_layers = []
     decoder_layers = []
 
@@ -481,25 +480,31 @@ def apply_selective_l1_pruning(model, amount=0.3, make_permanent=False):
             elif "decoder" in name:
                 decoder_layers.append((name, module))
 
-    # Get first and last layers for encoder and decoder
-    if encoder_layers:
-        first_last_layers.append(encoder_layers[0])  # First encoder layer
-        first_last_layers.append(encoder_layers[-1])  # Last encoder layer
+    # Select target layer based on input parameter
+    target_layer = None
+    if target == "encoder_first" and encoder_layers:
+        target_layer = encoder_layers[0]
+        print(f"Targeting FIRST encoder layer: {target_layer[0]}")
+    elif target == "encoder_last" and encoder_layers:
+        target_layer = encoder_layers[-1]
+        print(f"Targeting LAST encoder layer: {target_layer[0]}")
+    elif target == "decoder_first" and decoder_layers:
+        target_layer = decoder_layers[0]
+        print(f"Targeting FIRST decoder layer: {target_layer[0]}")
+    elif target == "decoder_last" and decoder_layers:
+        target_layer = decoder_layers[-1]
+        print(f"Targeting LAST decoder layer: {target_layer[0]}")
 
-    if decoder_layers:
-        first_last_layers.append(decoder_layers[0])  # First decoder layer
-        first_last_layers.append(decoder_layers[-1])  # Last decoder layer
-
-    if not first_last_layers:
-        print("Warning: No encoder/decoder layers found to prune!")
+    if not target_layer:
+        print(f"Warning: Target layer '{target}' not found!")
         return model
 
-    # Prepare parameters to prune
+    # Prepare parameter to prune
+    name, module = target_layer
     params_to_prune = []
-    for name, module in first_last_layers:
-        if hasattr(module, "weight"):
-            params_to_prune.append((module, "weight"))
-            print(f"Adding layer for pruning: {name}")
+    if hasattr(module, "weight"):
+        params_to_prune.append((module, "weight"))
+        print(f"Adding layer for pruning: {name}")
 
     print(
         f"Found {len(params_to_prune)} modules to prune with L1 unstructured pruning, amount={amount}"
@@ -568,15 +573,13 @@ def calculate_sparsity(model):
     return sparsity, total_params, non_zero_params
 
 
-def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=True):
+def load_whisper_model(model_name, device):
     """
-    Load Whisper model and optionally apply pruning.
+    Load Whisper model.
 
     Args:
         model_name: The Whisper model name
         device: Device to load the model to
-        pruning_amount: Amount to prune (0.0 to 0.99) or None for no pruning
-        make_permanent: Whether to make pruning permanent
 
     Returns:
         WhisperForConditionalGeneration model
@@ -584,19 +587,6 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
     try:
         # Load model without device_map
         model = WhisperForConditionalGeneration.from_pretrained(model_name, device_map=None)
-
-        # Apply pruning if specified
-        if pruning_amount is not None and pruning_amount > 0:
-            print(f"Applying selective L1 unstructured pruning with amount={pruning_amount}")
-            model = apply_selective_l1_pruning(
-                model, amount=pruning_amount, make_permanent=make_permanent
-            )
-
-            # Calculate and print sparsity
-            sparsity, total_params, non_zero_params = calculate_sparsity(model)
-            print(f"Model sparsity after pruning: {sparsity:.2f}%")
-            print(f"Total parameters: {total_params:,}")
-            print(f"Non-zero parameters: {non_zero_params:,}")
 
         # Move model to device
         model = model.to(device)
@@ -880,199 +870,6 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     return buffer.getbuffer().nbytes / (1024**2)
 
 
-def create_summary_table(results):
-    """
-    Create a summary table of results comparing baseline, 30%, 40%, and 50% pruning.
-
-    Args:
-        results: Dictionary of results
-    """
-    # Format for pretty printing
-    print("\n" + "=" * 120)
-    print("SUMMARY TABLE: SELECTIVE LAYER PRUNING EXPERIMENT")
-    print("=" * 120)
-
-    # Define metrics to include in summary
-    metrics = [
-        "WER",
-        "CER",
-        "RTF",
-        "model_size_mb",
-        "sparse_model_size_mb",
-        "actual_sparsity",
-        "gflops",
-        "non_zero_parameters",
-    ]
-
-    # Print header
-    header = [
-        "Metric",
-        "Baseline",
-        "30% Pruning",
-        "40% Pruning",
-        "50% Pruning",
-        "Change 30%",
-        "Change 40%",
-        "Change 50%",
-    ]
-
-    # Format header
-    print(
-        f"{header[0]:<25} {header[1]:<12} {header[2]:<12} {header[3]:<12} {header[4]:<12} "
-        f"{header[5]:<12} {header[6]:<12} {header[7]:<12}"
-    )
-    print("-" * 120)
-
-    # Get model names
-    baseline_key = "baseline_clean"
-    p30_key = "selective_p30_clean"
-    p40_key = "selective_p40_clean"
-    p50_key = "selective_p50_clean"
-
-    # Process each metric
-    for metric in metrics:
-        row = [metric]
-
-        # Get baseline value
-        if baseline_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                baseline_val = results[baseline_key]["metrics"].get(metric, "N/A")
-            else:
-                baseline_val = results[baseline_key].get(metric, "N/A")
-
-            if isinstance(baseline_val, (int, float)):
-                if metric == "non_zero_parameters":
-                    row.append(f"{baseline_val:,}")
-                else:
-                    row.append(f"{baseline_val:.4f}")
-            else:
-                row.append(str(baseline_val))
-        else:
-            row.append("N/A")
-
-        # Get 30% pruning value
-        if p30_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                p30_val = results[p30_key]["metrics"].get(metric, "N/A")
-            else:
-                p30_val = results[p30_key].get(metric, "N/A")
-
-            if isinstance(p30_val, (int, float)):
-                if metric == "non_zero_parameters":
-                    row.append(f"{p30_val:,}")
-                else:
-                    row.append(f"{p30_val:.4f}")
-            else:
-                row.append(str(p30_val))
-        else:
-            row.append("N/A")
-
-        # Get 40% pruning value
-        if p40_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                p40_val = results[p40_key]["metrics"].get(metric, "N/A")
-            else:
-                p40_val = results[p40_key].get(metric, "N/A")
-
-            if isinstance(p40_val, (int, float)):
-                if metric == "non_zero_parameters":
-                    row.append(f"{p40_val:,}")
-                else:
-                    row.append(f"{p40_val:.4f}")
-            else:
-                row.append(str(p40_val))
-        else:
-            row.append("N/A")
-
-        # Get 50% pruning value
-        if p50_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                p50_val = results[p50_key]["metrics"].get(metric, "N/A")
-            else:
-                p50_val = results[p50_key].get(metric, "N/A")
-
-            if isinstance(p50_val, (int, float)):
-                if metric == "non_zero_parameters":
-                    row.append(f"{p50_val:,}")
-                else:
-                    row.append(f"{p50_val:.4f}")
-            else:
-                row.append(str(p50_val))
-        else:
-            row.append("N/A")
-
-        # Calculate changes for 30%
-        if baseline_key in results and p30_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                baseline_val = results[baseline_key]["metrics"].get(metric, None)
-                p30_val = results[p30_key]["metrics"].get(metric, None)
-            else:
-                baseline_val = results[baseline_key].get(metric, None)
-                p30_val = results[p30_key].get(metric, None)
-
-            if (
-                isinstance(baseline_val, (int, float))
-                and isinstance(p30_val, (int, float))
-                and baseline_val != 0
-            ):
-                change = 100.0 * (p30_val - baseline_val) / baseline_val
-                row.append(f"{change:+.2f}%")
-            else:
-                row.append("N/A")
-        else:
-            row.append("N/A")
-
-        # Calculate changes for 40%
-        if baseline_key in results and p40_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                baseline_val = results[baseline_key]["metrics"].get(metric, None)
-                p40_val = results[p40_key]["metrics"].get(metric, None)
-            else:
-                baseline_val = results[baseline_key].get(metric, None)
-                p40_val = results[p40_key].get(metric, None)
-
-            if (
-                isinstance(baseline_val, (int, float))
-                and isinstance(p40_val, (int, float))
-                and baseline_val != 0
-            ):
-                change = 100.0 * (p40_val - baseline_val) / baseline_val
-                row.append(f"{change:+.2f}%")
-            else:
-                row.append("N/A")
-        else:
-            row.append("N/A")
-
-        # Calculate changes for 50%
-        if baseline_key in results and p50_key in results:
-            if metric in ["WER", "CER", "RTF"]:
-                baseline_val = results[baseline_key]["metrics"].get(metric, None)
-                p50_val = results[p50_key]["metrics"].get(metric, None)
-            else:
-                baseline_val = results[baseline_key].get(metric, None)
-                p50_val = results[p50_key].get(metric, None)
-
-            if (
-                isinstance(baseline_val, (int, float))
-                and isinstance(p50_val, (int, float))
-                and baseline_val != 0
-            ):
-                change = 100.0 * (p50_val - baseline_val) / baseline_val
-                row.append(f"{change:+.2f}%")
-            else:
-                row.append("N/A")
-        else:
-            row.append("N/A")
-
-        # Print row
-        print(
-            f"{row[0]:<25} {row[1]:<12} {row[2]:<12} {row[3]:<12} {row[4]:<12} "
-            f"{row[5]:<12} {row[6]:<12} {row[7]:<12}"
-        )
-
-    print("=" * 120)
-
-
 def main():
     # Configuration to match the quantization code
     original_model_name = "openai/whisper-small"
@@ -1087,8 +884,11 @@ def main():
         device = torch.device("mps")  # Use MPS for Apple Silicon if available
     print(f"Using {device}")
 
-    # Define the pruning percentages to test (30%, 40%, and 50%)
-    pruning_percentages = [0.3, 0.4, 0.5]
+    # Define the pruning percentages to test (30%, 40%, 50%, and 60%)
+    pruning_percentages = [0.3, 0.4, 0.5, 0.6]
+
+    # Define the target layers to test
+    target_layers = ["encoder_first", "encoder_last", "decoder_first", "decoder_last"]
 
     # Load processor once - can be shared across models
     processor = WhisperProcessor.from_pretrained(original_model_name)
@@ -1112,115 +912,80 @@ def main():
     # Store results
     results = {}
 
-    # Define model configurations
-    model_configs = {
-        "baseline": {
-            "pruning_amount": None  # No pruning for baseline
-        }
-    }
+    # Evaluate each target layer at each pruning percentage
+    for target in target_layers:
+        for percent in pruning_percentages:
+            model_name = f"{target}_p{int(percent*100)}"
 
-    # Add pruning configurations
-    for percent in pruning_percentages:
-        model_configs[f"selective_p{int(percent*100)}"] = {
-            "pruning_amount": percent  # Already in fraction format
-        }
+            print("\n" + "=" * 50)
+            print(f"Evaluating {model_name}")
+            print("=" * 50)
 
-    # Evaluate each configuration
-    for model_name, config in model_configs.items():
-        print("\n" + "=" * 50)
-        print(f"Evaluating {model_name}")
-        print("=" * 50)
+            clear_gpu_memory()
 
-        # Clear memory before loading new model
-        clear_gpu_memory()
+            try:
+                # Load model
+                model = load_whisper_model(model_name=original_model_name, device=device)
 
-        try:
-            # Load and prune model
-            model = load_whisper_model(
-                model_name=original_model_name,
-                device=device,
-                pruning_amount=config["pruning_amount"],
-                make_permanent=True,
-            )
+                # Apply targeted pruning
+                model = apply_targeted_layer_pruning(
+                    model=model,
+                    target=target,
+                    amount=percent,
+                    make_permanent=True,
+                )
 
-            # Calculate actual sparsity and parameter counts
-            sparsity, total_params, non_zero_params = calculate_sparsity(model)
-            print(f"Actual model sparsity: {sparsity:.2f}%")
-            print(f"Total parameters: {total_params:,}")
-            print(f"Non-zero parameters: {non_zero_params:,}")
+                # Calculate metrics
+                sparsity, total_params, non_zero_params = calculate_sparsity(model)
+                gflops = calculate_model_gflops(model)
 
-            # Calculate model GFLOPs
-            gflops = calculate_model_gflops(model)
-            print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
+                # Evaluate on both splits
+                for split, dataset in [
+                    ("clean", processed_test_data_clean),
+                    ("other", processed_test_data_other),
+                ]:
+                    print(f"\nEvaluating on {split} split...")
 
-            # Evaluate on both splits
-            for split, dataset in [
-                ("clean", processed_test_data_clean),
-                ("other", processed_test_data_other),
-            ]:
-                print(f"\nEvaluating on {split} split...")
+                    # Initialize memory tracker
+                    tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
 
-                # Initialize memory tracker for this run
-                tracker = WhisperMemoryTracker(f"{model_name}_{split}", save_path)
+                    try:
+                        scores, result = evaluate_model(
+                            model=model,
+                            processor=processor,
+                            dataset=dataset,
+                            metrics=metrics,
+                            memory_tracker=tracker,
+                            batch_size=batch_size,
+                            split=split,
+                        )
 
-                try:
-                    scores, result = evaluate_model(
-                        model=model,
-                        processor=processor,
-                        dataset=dataset,
-                        metrics=metrics,
-                        memory_tracker=tracker,
-                        batch_size=batch_size,
-                        split=split,
-                    )
-
-                    # Store and save results
-                    if isinstance(scores, dict) and "error" not in scores:
-                        # Get model size
+                        # Store results
                         model_size = get_model_disk_size_in_mb(model)
-
-                        # Calculate theoretical size of a dense model with pruned weights removed
-                        theoretical_dense_pruned_size = 0.0
-                        if config["pruning_amount"] is not None and config["pruning_amount"] > 0:
-                            # Calculate what the size would be if we removed zeros (without creating the model)
-                            theoretical_dense_pruned_size = calculate_pruned_dense_size(
-                                model, pruning_threshold=0.0
-                            )
-                            print(
-                                f"Theoretical dense pruned model size: {theoretical_dense_pruned_size:.2f} MB"
-                            )
-
-                        # Build results dictionary
                         results[f"{model_name}_{split}"] = {
                             "metrics": scores,
                             "model_size_mb": model_size,
                             "model_type": model_name,
-                            "gflops": gflops,  # Add GFLOPs to results
-                            "pruning_percentage": 0
-                            if "baseline" in model_name
-                            else int(float(config["pruning_amount"]) * 100),
+                            "gflops": gflops,
+                            "pruning_percentage": int(percent * 100),
                             "actual_sparsity": sparsity,
-                            "total_parameters": total_params,  # Add total parameter count
-                            "non_zero_parameters": non_zero_params,  # Add non-zero parameter count
-                            "theoretical_dense_pruned_size_mb": theoretical_dense_pruned_size,  # Add theoretical size
+                            "total_parameters": total_params,
+                            "non_zero_parameters": non_zero_params,
+                            "target_layer": target,
                         }
 
                         # Save metrics
                         metrics_path = os.path.join(save_path, f"{model_name}_{split}_summary.json")
                         with open(metrics_path, "w") as f:
                             json.dump(results[f"{model_name}_{split}"], f, indent=2)
-                        print(f"Saved metrics to {metrics_path}")
 
-                except Exception as e:
-                    print(f"Error evaluating {model_name} on {split} split: {e!s}")
-                    continue
+                    except Exception as e:
+                        print(f"Error evaluating {model_name} on {split} split: {e!s}")
 
-                finally:
-                    # Always close tracker and clear memory
-                    tracker.close()
+                    finally:
+                        tracker.close()
 
-            # Save sparse model if this is a pruned model
-            if "baseline" not in model_name:
+                # Save sparse model
                 sparse_model_path = os.path.join(MODELS_DIR, f"{model_name}_sparse.pt")
                 sparse_size = save_sparse_model(model, sparse_model_path)
 
@@ -1229,38 +994,124 @@ def main():
                     result_key = f"{model_name}_{split}"
                     if result_key in results:
                         results[result_key]["sparse_model_size_mb"] = sparse_size
-                        if sparse_size > 0 and results[result_key]["model_size_mb"] > 0:
-                            results[result_key]["size_reduction_percent"] = (
-                                100.0
-                                * (results[result_key]["model_size_mb"] - sparse_size)
-                                / results[result_key]["model_size_mb"]
-                            )
 
                         # Update the saved metrics file
-                        metrics_path = os.path.join(save_path, f"{model_name}_{split}_summary.json")
+                        metrics_path = os.path.join(save_path, f"{result_key}_summary.json")
                         with open(metrics_path, "w") as f:
                             json.dump(results[result_key], f, indent=2)
 
-            # Clear model from memory
-            del model
-            clear_gpu_memory()
+                # Clean up
+                del model
+                clear_gpu_memory()
 
-        except Exception as e:
-            print(f"Error setting up {model_name}: {e!s}")
-            continue
+            except Exception as e:
+                print(f"Error setting up {model_name}: {e!s}")
+                continue
 
     # Save all results to a single file
-    all_results_path = os.path.join(SELECTIVE_PRUNING_DIR, "all_results.json")
+    all_results_path = os.path.join(SELECTIVE_PRUNING_DIR, "individual_layer_results.json")
     with open(all_results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"All results saved to {all_results_path}")
 
-    # Create summary table instead of plots
-    create_summary_table(results)
+    # Create summary tables for each target
+    print("\n" + "=" * 120)
+    print("SUMMARY TABLES BY TARGET LAYER")
+    print("=" * 120)
 
-    # Print summary
+    # Print summary tables for each target layer and split
+    for target in target_layers:
+        for split in ["clean", "other"]:
+            print(f"\n=== {target.upper()} PRUNING SUMMARY ({split} split) ===")
+
+            # Format header
+            header = ["Metric", "30% Pruning", "40% Pruning", "50% Pruning", "60% Pruning"]
+            print(
+                f"{header[0]:<25} {header[1]:<12} {header[2]:<12} {header[3]:<12} {header[4]:<12}"
+            )
+            print("-" * 80)
+
+            # Define metrics to include
+            metrics = [
+                "WER",
+                "CER",
+                "RTF",
+                "model_size_mb",
+                "sparse_model_size_mb",
+                "actual_sparsity",
+                "gflops",
+            ]
+
+            # Get keys
+            p30_key = f"{target}_p30_{split}"
+            p40_key = f"{target}_p40_{split}"
+            p50_key = f"{target}_p50_{split}"
+            p60_key = f"{target}_p60_{split}"
+
+            for metric in metrics:
+                row = [metric]
+
+                # Get 30% pruning value
+                if p30_key in results:
+                    if metric in ["WER", "CER", "RTF"]:
+                        p30_val = results[p30_key]["metrics"].get(metric, "N/A")
+                    else:
+                        p30_val = results[p30_key].get(metric, "N/A")
+
+                    if isinstance(p30_val, (int, float)):
+                        row.append(f"{p30_val:.4f}")
+                    else:
+                        row.append(str(p30_val))
+                else:
+                    row.append("N/A")
+
+                # Get 40% pruning value
+                if p40_key in results:
+                    if metric in ["WER", "CER", "RTF"]:
+                        p40_val = results[p40_key]["metrics"].get(metric, "N/A")
+                    else:
+                        p40_val = results[p40_key].get(metric, "N/A")
+
+                    if isinstance(p40_val, (int, float)):
+                        row.append(f"{p40_val:.4f}")
+                    else:
+                        row.append(str(p40_val))
+                else:
+                    row.append("N/A")
+
+                # Get 50% pruning value
+                if p50_key in results:
+                    if metric in ["WER", "CER", "RTF"]:
+                        p50_val = results[p50_key]["metrics"].get(metric, "N/A")
+                    else:
+                        p50_val = results[p50_key].get(metric, "N/A")
+
+                    if isinstance(p50_val, (int, float)):
+                        row.append(f"{p50_val:.4f}")
+                    else:
+                        row.append(str(p50_val))
+                else:
+                    row.append("N/A")
+
+                # Get 60% pruning value
+                if p60_key in results:
+                    if metric in ["WER", "CER", "RTF"]:
+                        p60_val = results[p60_key]["metrics"].get(metric, "N/A")
+                    else:
+                        p60_val = results[p60_key].get(metric, "N/A")
+
+                    if isinstance(p60_val, (int, float)):
+                        row.append(f"{p60_val:.4f}")
+                    else:
+                        row.append(str(p60_val))
+                else:
+                    row.append("N/A")
+
+                # Print row
+                print(f"{row[0]:<25} {row[1]:<12} {row[2]:<12} {row[3]:<12} {row[4]:<12}")
+
     print("\n" + "=" * 60)
-    print("SELECTIVE LAYER PRUNING EXPERIMENT COMPLETE")
+    print("INDIVIDUAL LAYER PRUNING EXPERIMENT COMPLETE")
     print("=" * 60)
     print(f"Results saved to: {SELECTIVE_PRUNING_DIR}")
     print(f"Sparse models saved to: {MODELS_DIR}")
