@@ -21,8 +21,8 @@ sns.set(style="whitegrid")
 # Create results directory
 RESULTS_DIR = "pruning/whisper_pruning_results"
 L1_PRUNING_DIR = os.path.join(
-    RESULTS_DIR, "l1_bias_pruning"
-)  # Changed directory name to reflect bias pruning
+    RESULTS_DIR, "l1_all_bias_pruning"  # Updated directory name to reflect all bias pruning
+)
 PLOTS_DIR = os.path.join(L1_PRUNING_DIR, "plots")
 MODELS_DIR = os.path.join(L1_PRUNING_DIR, "models")
 
@@ -508,26 +508,19 @@ def apply_l1_pruning(model, amount=0.3, target_patterns=None, make_permanent=Fal
     Returns:
         Pruned model
     """
-    # Apply default target pattern if none specified - FC1 bias layers in the encoder
+    # UPDATED: Target ALL bias parameters across the entire model
     if target_patterns is None:
-        target_patterns = [
-            "encoder.layers.0.fc1.bias",
-            "encoder.layers.1.fc1.bias",
-            "encoder.layers.2.fc1.bias",
-            "encoder.layers.3.fc1.bias",
-            "encoder.layers.4.fc1.bias",
-        ]
-
-    print("Will target these bias layers for pruning:")
-    for pattern in target_patterns:
-        print(f"  {pattern}")
-
+        # Use a general pattern that will match all bias parameters
+        target_patterns = ["bias"]  # This will match any parameter with "bias" in its name
+    
+    print("Will target ALL bias layers across the entire model for pruning")
+    
     # Get parameters to prune based on pattern matching
     params_to_prune = []
-
-    # Find modules containing our target bias parameters
+    
+    # Find modules containing bias parameters
     for name, module in model.named_modules():
-        # Find modules that contain our target biases
+        # Find modules that contain bias parameters
         if hasattr(module, "bias") and module.bias is not None:
             for param_name, param in module.named_parameters(recurse=False):
                 if param_name == "bias":
@@ -535,7 +528,6 @@ def apply_l1_pruning(model, amount=0.3, target_patterns=None, make_permanent=Fal
                     full_param_name = f"{name}.{param_name}"
                     # Check if it matches any of our patterns
                     if any(pattern in full_param_name for pattern in target_patterns):
-                        print(f"  Found target bias: {full_param_name}")
                         params_to_prune.append((module, "bias"))
                         break
 
@@ -546,6 +538,18 @@ def apply_l1_pruning(model, amount=0.3, target_patterns=None, make_permanent=Fal
     print(
         f"Found {len(params_to_prune)} modules with bias to prune with L1 unstructured pruning, amount={amount}"
     )
+
+    # Display a sample of modules being pruned (to avoid excessive logging)
+    sample_size = min(10, len(params_to_prune))
+    print(f"Sample of {sample_size} modules being pruned:")
+    for i, (module, _) in enumerate(params_to_prune[:sample_size]):
+        for name, mod in model.named_modules():
+            if mod is module:
+                print(f"  {i+1}. {name}.bias")
+                break
+    
+    if len(params_to_prune) > sample_size:
+        print(f"  ... and {len(params_to_prune) - sample_size} more")
 
     # Apply L1 unstructured pruning individually to each module to avoid errors
     success_count = 0
@@ -564,9 +568,15 @@ def apply_l1_pruning(model, amount=0.3, target_patterns=None, make_permanent=Fal
             non_zeros_after = torch.sum(pruned_param != 0).item()
             sparsity = 100.0 * (total - non_zeros_after) / total
 
-            print(
-                f"  Pruned {param_name}: {non_zeros_before} → {non_zeros_after} non-zeros ({sparsity:.2f}% sparse)"
-            )
+            # Only log significant changes to avoid excessive output
+            if total > 100 or (total - non_zeros_after) > 10:
+                for name, mod in model.named_modules():
+                    if mod is module:
+                        print(
+                            f"  Pruned {name}.{param_name}: {non_zeros_before} → {non_zeros_after} non-zeros ({sparsity:.2f}% sparse)"
+                        )
+                        break
+
             success_count += 1
 
             # Make pruning permanent if requested
@@ -626,7 +636,7 @@ def load_whisper_model(model_name, device, pruning_amount=None, make_permanent=T
 
         # Apply pruning if specified
         if pruning_amount is not None and pruning_amount > 0:
-            print(f"Applying L1 unstructured pruning to bias terms with amount={pruning_amount}")
+            print(f"Applying L1 unstructured pruning to ALL bias terms with amount={pruning_amount}")
             model = apply_l1_pruning(model, amount=pruning_amount, make_permanent=make_permanent)
 
             # Calculate and print sparsity
@@ -1056,9 +1066,9 @@ def create_plots(results, metric_names, plot_dir):
             legend_entries.append(f"{split} split")
 
         # Add labels and title
-        plt.xlabel("Bias Pruning Percentage (%)")  # Updated label
+        plt.xlabel("Bias Pruning Percentage (%)")
         plt.ylabel(metric)
-        plt.title(f"{metric} vs L1 Unstructured Bias Pruning Percentage")  # Updated title
+        plt.title(f"{metric} vs L1 Unstructured Bias Pruning Percentage (All Biases)")
         plt.grid(True)
 
         # Only add legend if we have plot lines
@@ -1127,9 +1137,9 @@ def create_plots(results, metric_names, plot_dir):
             label="Theoretical dense pruned size",
         )
 
-    plt.xlabel("Bias Pruning Percentage (%)")  # Updated label
+    plt.xlabel("Bias Pruning Percentage (%)")
     plt.ylabel("Model Size (MB)")
-    plt.title("Model Size vs L1 Unstructured Bias Pruning Percentage")  # Updated title
+    plt.title("Model Size vs L1 Unstructured Bias Pruning Percentage (All Biases)")
     plt.grid(True)
     plt.legend()
 
@@ -1165,11 +1175,9 @@ def create_plots(results, metric_names, plot_dir):
             [p for p, _ in gflops_data], [g for _, g in gflops_data], marker="o", label="GFLOPs"
         )
 
-    plt.xlabel("Bias Pruning Percentage (%)")  # Updated label
+    plt.xlabel("Bias Pruning Percentage (%)")
     plt.ylabel("GFLOPs")
-    plt.title(
-        "Computational Complexity (GFLOPs) vs L1 Unstructured Bias Pruning Percentage"
-    )  # Updated title
+    plt.title("Computational Complexity (GFLOPs) vs L1 Unstructured Bias Pruning Percentage (All Biases)")
     plt.grid(True)
     plt.legend()
 
@@ -1210,19 +1218,19 @@ def create_plots(results, metric_names, plot_dir):
             [p for p, _ in total_params],
             [t / 1_000_000 for _, t in total_params],
             marker="o",
-            label="Total bias parameters",  # Updated label
+            label="Total bias parameters", 
         )
     if non_zero_params:
         plt.plot(
             [p for p, _ in non_zero_params],
             [nz / 1_000_000 for _, nz in non_zero_params],
             marker="s",
-            label="Non-zero bias parameters",  # Updated label
+            label="Non-zero bias parameters",
         )
 
-    plt.xlabel("Bias Pruning Percentage (%)")  # Updated label
+    plt.xlabel("Bias Pruning Percentage (%)")
     plt.ylabel("Parameters (millions)")
-    plt.title("Bias Parameter Count vs L1 Unstructured Bias Pruning Percentage")  # Updated title
+    plt.title("Bias Parameter Count vs L1 Unstructured Bias Pruning Percentage (All Biases)")
     plt.grid(True)
     plt.legend()
 
@@ -1250,24 +1258,12 @@ def main():
     # Define the pruning percentages to test (0% to 50% with intervals of 10%)
     pruning_percentages = [0, 10, 20, 30, 40, 50]
 
-    # Target specific encoder FC1 bias layers
-    target_bias_patterns = [
-        "encoder.layers.0.fc1.bias",
-        "encoder.layers.1.fc1.bias",
-        "encoder.layers.2.fc1.bias",
-        "encoder.layers.3.fc1.bias",
-        "encoder.layers.4.fc1.bias",
-    ]
-
     # Load processor once - can be shared across models
     processor = WhisperProcessor.from_pretrained(original_model_name)
 
-    # Initially try with smaller datasets for testing
-    test_sample_count = 100  # Start with a small number to verify functionality
-
     print("\nLoading smaller datasets for testing...")
-    dataset_clean = load_librispeech(num_samples=test_sample_count, split="test.clean")
-    dataset_other = load_librispeech(num_samples=test_sample_count, split="test.other")
+    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")  # Use full test.clean
+    dataset_other = load_librispeech(num_samples=2939, split="test.other")  # Use full test.other
 
     print(f"Clean dataset: {len(dataset_clean)} samples")
     print(f"Other dataset: {len(dataset_other)} samples")
@@ -1447,7 +1443,7 @@ def main():
 
     # Print summary
     print("\n" + "=" * 60)
-    print("L1 UNSTRUCTURED BIAS PRUNING EXPERIMENT SUMMARY")  # Updated title
+    print("L1 UNSTRUCTURED BIAS PRUNING EXPERIMENT SUMMARY (ALL BIASES)")
     print("=" * 60)
 
     print("\nBaseline (0% pruning):")
@@ -1458,10 +1454,10 @@ def main():
         print(f"  RTF: {baseline['metrics']['RTF']:.4f}")
         print(f"  Model Size: {baseline['model_size_mb']:.2f} MB")
         print(f"  GFLOPs: {baseline['gflops']:.4f}")
-        print(f"  Total Bias Parameters: {baseline['total_parameters']:,}")  # Updated label
-        print(f"  Non-zero Bias Parameters: {baseline['non_zero_parameters']:,}")  # Updated label
+        print(f"  Total Bias Parameters: {baseline['total_parameters']:,}")
+        print(f"  Non-zero Bias Parameters: {baseline['non_zero_parameters']:,}")
 
-    print("\nResults for different bias pruning percentages:")  # Updated label
+    print("\nResults for different bias pruning percentages:")
     for percent in pruning_percentages:
         if percent == 0:
             continue
@@ -1504,7 +1500,7 @@ def main():
                 if "non_zero_parameters" in result and "non_zero_parameters" in baseline:
                     param_change = f"{(result['non_zero_parameters'] - baseline['non_zero_parameters']) / baseline['non_zero_parameters'] * 100:+.2f}%"
 
-            print(f"\n{percent}% bias pruning:")  # Updated label
+            print(f"\n{percent}% bias pruning:")
             if "WER" in result["metrics"]:
                 print(f"  WER: {result['metrics']['WER']:.4f} ({wer_change})")
             if "CER" in result["metrics"]:
@@ -1525,13 +1521,13 @@ def main():
             if "gflops" in result:
                 print(f"  GFLOPs: {result['gflops']:.4f} ({gflops_change})")
             if "actual_sparsity" in result:
-                print(f"  Actual Bias Sparsity: {result['actual_sparsity']:.2f}%")  # Updated label
+                print(f"  Actual Bias Sparsity: {result['actual_sparsity']:.2f}%")
             if "total_parameters" in result:
-                print(f"  Total Bias Parameters: {result['total_parameters']:,}")  # Updated label
+                print(f"  Total Bias Parameters: {result['total_parameters']:,}")
             if "non_zero_parameters" in result:
                 print(
                     f"  Non-zero Bias Parameters: {result['non_zero_parameters']:,} ({param_change})"
-                )  # Updated label
+                )
 
     print("\nPlots saved to:", PLOTS_DIR)
     print("Sparse models saved to:", MODELS_DIR)
