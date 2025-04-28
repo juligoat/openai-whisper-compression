@@ -167,7 +167,7 @@ def compute_sensitivity_mps(
     """
     Compute parameter sensitivity optimized for MPS.
     Uses gradient magnitude as the primary metric with fallbacks for complex operations.
-    
+
     Args:
         model: The Whisper model
         processor: The Whisper processor
@@ -177,7 +177,7 @@ def compute_sensitivity_mps(
         model_info: Dictionary with model metadata
         num_batches: Number of batches to process
         chunk_size: Number of parameters to process in a single chunk
-        
+
     Returns:
         Dictionary containing parameter and layer importance
     """
@@ -189,7 +189,7 @@ def compute_sensitivity_mps(
     for name, param in model.named_parameters():
         if "weight" in name and param.dim() > 1:  # Focus on weight matrices
             category = categorize_parameter(name)
-            
+
             sensitivity_results[name] = {
                 "shape": list(param.shape),
                 "size": param.numel(),
@@ -198,12 +198,12 @@ def compute_sensitivity_mps(
                 "param_values": param.detach().cpu().numpy().flatten().tolist()[:5],
                 "batch_count": 0,
             }
-            
+
             param_list.append((name, param))
-    
+
     # Group parameters into chunks for processing to avoid memory issues
-    param_chunks = [param_list[i:i + chunk_size] for i in range(0, len(param_list), chunk_size)]
-    
+    param_chunks = [param_list[i : i + chunk_size] for i in range(0, len(param_list), chunk_size)]
+
     # Set model to evaluation mode but enable gradients
     model.eval()
 
@@ -217,7 +217,7 @@ def compute_sensitivity_mps(
         # Process a single batch
         try:
             # Get a single sample (keep batch size to 1 for stability on MPS)
-            batch_samples = samples[sample_idx:sample_idx + 1]
+            batch_samples = samples[sample_idx : sample_idx + 1]
             sample_idx += 1
 
             # Process each sample in the batch
@@ -228,7 +228,7 @@ def compute_sensitivity_mps(
 
                 # Step 1: Compute first-order gradients for sensitivity
                 model.zero_grad()
-                
+
                 # On MPS, some operations might need CPU fallback
                 try:
                     # Forward pass with enabled gradients
@@ -237,7 +237,7 @@ def compute_sensitivity_mps(
                         decoder_input_ids=target_ids[:, :-1] if target_ids.size(1) > 1 else None,
                         labels=target_ids if target_ids.size(1) <= 1 else target_ids[:, 1:],
                     )
-                    
+
                     loss = outputs.loss
                     loss.backward()
                 except Exception as e:
@@ -246,20 +246,24 @@ def compute_sensitivity_mps(
                     cpu_features = features.cpu()
                     cpu_target_ids = target_ids.cpu()
                     model.cpu()
-                    
+
                     # Forward pass on CPU
                     outputs = model(
                         input_features=cpu_features,
-                        decoder_input_ids=cpu_target_ids[:, :-1] if cpu_target_ids.size(1) > 1 else None,
-                        labels=cpu_target_ids if cpu_target_ids.size(1) <= 1 else cpu_target_ids[:, 1:],
+                        decoder_input_ids=cpu_target_ids[:, :-1]
+                        if cpu_target_ids.size(1) > 1
+                        else None,
+                        labels=cpu_target_ids
+                        if cpu_target_ids.size(1) <= 1
+                        else cpu_target_ids[:, 1:],
                     )
-                    
+
                     loss = outputs.loss
                     loss.backward()
-                    
+
                     # Move model back to original device
                     model.to(device)
-                
+
                 # Process parameters in chunks to save memory
                 for chunk in param_chunks:
                     for name, param in chunk:
@@ -267,10 +271,12 @@ def compute_sensitivity_mps(
                             # Calculate L1 norm of gradient (absolute gradient magnitude)
                             # Use this as a reliable sensitivity metric that works on MPS
                             grad_magnitude = param.grad.abs().mean().item()
-                            
+
                             # Store valid results
                             if np.isfinite(grad_magnitude) and grad_magnitude > 0:
-                                sensitivity_results[name]["sensitivity_samples"].append(grad_magnitude)
+                                sensitivity_results[name]["sensitivity_samples"].append(
+                                    grad_magnitude
+                                )
                                 sensitivity_results[name]["batch_count"] += 1
 
                 # Clear memory
@@ -279,7 +285,7 @@ def compute_sensitivity_mps(
             # Update batch counter and progress bar
             batch_count += 1
             pbar.update(1)
-            
+
             # Clear memory between batches
             clear_memory()
 
@@ -994,9 +1000,7 @@ def create_detailed_layer_plots(
     plt.savefig(
         os.path.join(output_dir, "layer_by_layer_sensitivity.png"), dpi=300, bbox_inches="tight"
     )
-    plt.savefig(
-        os.path.join(output_dir, "layer_by_layer_sensitivity.pdf"), bbox_inches="tight"
-    )
+    plt.savefig(os.path.join(output_dir, "layer_by_layer_sensitivity.pdf"), bbox_inches="tight")
     plt.close(fig)
 
     # Other detailed visualizations are created in similar fashion (omitted for brevity)
@@ -1123,7 +1127,7 @@ def run_mps_sensitivity_analysis(
 ) -> Tuple[str, Dict]:
     """
     Run a sensitivity analysis for Whisper model optimized for MPS (Apple Silicon).
-    
+
     Args:
         model_name: The Whisper model name ("openai/whisper-small")
         output_dir: Output directory (defaults to timestamped directory)
@@ -1224,12 +1228,12 @@ def run_mps_sensitivity_analysis(
 
     # 2. Load and process dataset - with MPS optimizations
     print(f"\nLoading {split} dataset with {num_samples} samples...")
-    
+
     try:
         # Process in smaller chunks to avoid memory issues
         dataset = load_librispeech(num_samples=num_samples, split=split)
         print("\nProcessing dataset...")
-        
+
         # Process each sample individually to avoid batch collation issues
         processed_samples = []
         for i, sample in enumerate(tqdm(dataset, desc="Processing samples")):
@@ -1245,13 +1249,17 @@ def run_mps_sensitivity_analysis(
                 text_encoding = processor(text=text, return_tensors="pt")
 
                 processed_samples.append(
-                    {"input_features": input_features, "text_ids": text_encoding.input_ids, "text": text}
+                    {
+                        "input_features": input_features,
+                        "text_ids": text_encoding.input_ids,
+                        "text": text,
+                    }
                 )
-                
+
                 # Clear memory periodically
                 if i % 100 == 0:
                     clear_memory()
-                    
+
             except Exception as e:
                 print(f"Error processing sample {i}: {e}")
                 continue
@@ -1287,7 +1295,7 @@ def run_mps_sensitivity_analysis(
     # 5. Create summary visualization
     print("\nCreating visualizations...")
     create_summary_plot(sensitivity_results, output_dir, model_info)
-    
+
     # 6. Create detailed layer-by-layer visualization
     create_detailed_layer_plots(sensitivity_results, output_dir, model_info)
 
@@ -1338,7 +1346,7 @@ def parse_arguments():
 def main():
     """Main function to run sensitivity analysis optimized for MPS"""
     start_time = time.time()
-    
+
     # Parse arguments
     args = parse_arguments()
 
@@ -1350,11 +1358,11 @@ def main():
         split=args.split,
         output_dir=args.output_dir,
     )
-    
+
     elapsed_time = time.time() - start_time
     hours, remainder = divmod(elapsed_time, 3600)
     minutes, seconds = divmod(remainder, 60)
-    
+
     print(f"MPS-optimized sensitivity analysis complete. Results saved to: {results_dir}")
     print(f"Total runtime: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
 
