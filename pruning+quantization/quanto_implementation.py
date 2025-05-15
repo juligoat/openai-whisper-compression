@@ -12,13 +12,15 @@ import torch
 import torch.nn.utils.prune as prune
 from evaluate import load
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from optimum.quanto import freeze, qint4, qint8, quantize
 
 # Create results directory
-RESULTS_DIR = "global_pruning_pytorch_quantization_results"
+RESULTS_DIR = "global_pruning_quanto_quantization_results"
 PRUNED_MODEL_DIR = os.path.join(RESULTS_DIR, "global_pruned_model")
-PYTORCH_QUANT_DIR = os.path.join(RESULTS_DIR, "global_pruned_pytorch_quantized")
+QUANTO_QINT4_DIR = os.path.join(RESULTS_DIR, "global_pruned_quanto_qint4")
+QUANTO_QINT8_DIR = os.path.join(RESULTS_DIR, "global_pruned_quanto_qint8")
 
-for directory in [RESULTS_DIR, PRUNED_MODEL_DIR, PYTORCH_QUANT_DIR]:
+for directory in [RESULTS_DIR, PRUNED_MODEL_DIR, QUANTO_QINT4_DIR, QUANTO_QINT8_DIR]:
     os.makedirs(directory, exist_ok=True)
 
 
@@ -194,74 +196,63 @@ def calculate_pruned_dense_size(model, pruning_threshold=0.0):
     return dense_pruned_size_mb
 
 
-def calculate_theoretical_quantized_size(model, pruning_threshold=0.0, int8_quantization=True):
+def calculate_theoretical_quantized_size(model, bit_width=8):
     """
-    Calculate the theoretical size of a model that is both pruned and quantized with PyTorch.
-
+    Calculate the theoretical size of a model after Quanto quantization.
+    Takes into account that Quanto quantization keeps the dense format, meaning zeros still take up space.
+    
     Args:
-        model: The pruned model
-        pruning_threshold: Values with absolute value below this threshold are considered pruned
-        int8_quantization: Whether INT8 quantization is applied (PyTorch dynamic)
-
+        model: The model to quantize (can be pruned or not)
+        bit_width: Quantization bit width (4 for INT4, 8 for INT8)
+    
     Returns:
-        float: Theoretical size in MB after pruning + quantization
+        float: Theoretical size in MB after quantization
     """
-    print("\n=== Calculating theoretical size with pruning + PyTorch INT8 quantization ===")
-
-    # PyTorch dynamic quantization uses INT8 for weights
-    bits_per_param = 8 if int8_quantization else 32
-    bytes_per_param = bits_per_param / 8
-
-    total_params_original = 0
-    total_non_zero_params = 0
-    total_bytes_original = 0
-    total_bytes_quantized = 0
-
-    # Count parameters and calculate theoretical size
+    print(f"\n=== Calculating theoretical size with Quanto INT{bit_width} quantization ===")
+    
+    total_bytes = 0
+    weight_bytes = 0
+    bias_bytes = 0
+    
+    # Count parameters by type
+    total_weight_params = 0
+    total_bias_params = 0
+    
+    # For each parameter in the model
     for name, param in model.named_parameters():
-        param_size_bytes = param.numel() * 4  # Original size (FP32)
-        total_params_original += param.numel()
-        total_bytes_original += param_size_bytes
-
-        # Find non-zero values (not pruned)
-        pruned_mask = torch.abs(param) <= pruning_threshold
-        non_zero_params = param.numel() - torch.sum(pruned_mask).item()
-        total_non_zero_params += non_zero_params
-
-        # Calculate size with quantization (only quantize Linear module weights)
-        if "weight" in name and any(
-            layer_type in name for layer_type in ["linear", "Linear", "layer"]
-        ):
-            # For quantizable parameters, use reduced bit precision
-            param_quantized_bytes = non_zero_params * bytes_per_param
+        # Weights are quantized to reduced precision
+        if "weight" in name:
+            # Each weight uses bit_width bits regardless of whether it's zero or not
+            param_bytes = param.numel() * (bit_width / 8) 
+            # Add quantization overhead (scales, zero points) - approximately 0.1% overhead
+            param_bytes += param.numel() * (bit_width / 8) * 0.001
+            weight_bytes += param_bytes
+            total_weight_params += param.numel()
+        # Biases typically remain in FP32
         else:
-            # Non-weight params stay FP32
-            param_quantized_bytes = non_zero_params * 4
-
-        total_bytes_quantized += param_quantized_bytes
-
+            param_bytes = param.numel() * 4  # 4 bytes per float32
+            bias_bytes += param_bytes
+            total_bias_params += param.numel()
+            
+        total_bytes += param_bytes
+    
     # Convert to MB
-    original_size_mb = total_bytes_original / (1024 * 1024)
-    quantized_size_mb = total_bytes_quantized / (1024 * 1024)
-
-    # Report on size reduction
-    if total_params_original > 0:
-        pruning_reduction = (
-            100.0 * (total_params_original - total_non_zero_params) / total_params_original
-        )
-
-        size_reduction = 100.0 * (original_size_mb - quantized_size_mb) / original_size_mb
-
-        print(f"Original parameters: {total_params_original:,}")
-        print(f"Non-zero parameters after pruning: {total_non_zero_params:,}")
-        print(f"Parameter reduction from pruning: {pruning_reduction:.1f}%")
-        print(f"Original size (FP32): {original_size_mb:.2f} MB")
-        print(f"Size after PyTorch quantization (theoretical): {quantized_size_mb:.2f} MB")
-        print(f"Overall size reduction: {size_reduction:.1f}%")
-        print(f"Note: This is a theoretical calculation assuming optimal sparse storage")
-        print(f"      The actual quantized model may be larger due to storage format overheads")
-
-    return quantized_size_mb
+    total_size_mb = total_bytes / (1024 * 1024)
+    weight_size_mb = weight_bytes / (1024 * 1024)
+    bias_size_mb = bias_bytes / (1024 * 1024)
+    
+    # Original FP32 size for comparison
+    original_size_mb = (total_weight_params * 4 + total_bias_params * 4) / (1024 * 1024)
+    size_reduction = 100.0 * (original_size_mb - total_size_mb) / original_size_mb
+    
+    # Print size breakdown
+    print(f"Original model size (FP32): {original_size_mb:.2f} MB")
+    print(f"Theoretical quantized model size: {total_size_mb:.2f} MB")
+    print(f"  - Quantized weights ({bit_width}-bit): {weight_size_mb:.2f} MB")
+    print(f"  - FP32 biases: {bias_size_mb:.2f} MB")
+    print(f"Size reduction: {size_reduction:.1f}%")
+    
+    return total_size_mb
 
 
 def calculate_model_gflops(model):
@@ -645,8 +636,8 @@ def load_and_prune_whisper_model(model_name, device, pruning_config=None, make_p
             gflops = calculate_model_gflops(model)
             print(f"Estimated model complexity: {gflops:.4f} GFLOPs")
 
-        # Move model to device - always use CPU for fair comparison
-        model = model.to("cpu")
+        # Move model to device
+        model = model.to(device)
         model.config.forced_decoder_ids = None
         return model
     except Exception as e:
@@ -654,14 +645,28 @@ def load_and_prune_whisper_model(model_name, device, pruning_config=None, make_p
         raise
 
 
-def apply_pytorch_quantization(model):
+def apply_quanto_quantization(model, is_int4=False):
     """
-    Apply PyTorch dynamic quantization to a model.
+    Apply Quanto quantization to a model.
+    
+    Args:
+        model: The model to quantize
+        is_int4: If True, use INT4 quantization, otherwise use INT8
+    
+    Returns:
+        Quantized model
     """
-    print("Applying PyTorch dynamic quantization - PyTorch quantization is CPU-only")
-    # Apply PyTorch dynamic quantization (model should already be on CPU)
-    torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
-    print("PyTorch quantization applied")
+    if is_int4:
+        print("Applying Quanto INT4 quantization")
+        quantize(model, weights=qint4)
+    else:
+        print("Applying Quanto INT8 quantization")
+        quantize(model, weights=qint8)
+    
+    # Freeze the model
+    freeze(model)
+    
+    print(f"Quanto {'INT4' if is_int4 else 'INT8'} quantization applied")
     return model
 
 
@@ -987,10 +992,8 @@ def main():
     # Configuration
     original_model_name = "openai/whisper-small"
     batch_size = 16
-    
-    # Always use CPU for fair comparison between pruned and quantized models
-    device = torch.device("cpu")
-    print(f"Using CPU for all evaluations to ensure fair comparison")
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print(f"Starting with device: {device}")
 
     # Define custom pruning configuration with the specified percentages from the second script
     pruning_config = {
@@ -1038,7 +1041,7 @@ def main():
 
     clear_memory()
 
-    # Create the pruned base model using global pruning (on CPU for fair comparison)
+    # Create the pruned base model using global pruning
     pruned_model = load_and_prune_whisper_model(
         model_name=original_model_name,
         device=device,
@@ -1117,45 +1120,46 @@ def main():
     torch.save(pruned_model.state_dict(), pruned_model_path)
     print(f"Saved pruned model to {pruned_model_path}")
 
-    # Step 2: Apply PyTorch quantization to pruned model
+    # Step 2: Apply Quanto INT4 quantization to pruned model
     print("\n" + "=" * 50)
-    print("Applying PyTorch quantization to globally pruned model")
+    print("Applying Quanto INT4 quantization to globally pruned model")
     print("=" * 50)
 
     clear_memory()
 
-    # Apply PyTorch quantization to a fresh copy of the pruned model
-    pytorch_quantized_model = WhisperForConditionalGeneration.from_pretrained(original_model_name)
-    pytorch_quantized_model.load_state_dict(torch.load(pruned_model_path))
-    
-    # Ensure model is on CPU (should already be, but being explicit)
-    pytorch_quantized_model = pytorch_quantized_model.to("cpu") 
+    # Apply Quanto INT4 quantization to a fresh copy of the pruned model
+    qint4_model = WhisperForConditionalGeneration.from_pretrained(original_model_name)
+    qint4_model.load_state_dict(torch.load(pruned_model_path))
+    qint4_model = qint4_model.to(device)
+    qint4_model.config.forced_decoder_ids = None
 
-    # Calculate theoretical size with pruning + quantization
-    theoretical_pruned_quantized_size = calculate_theoretical_quantized_size(
-        pytorch_quantized_model, pruning_threshold=0.0, int8_quantization=True
+    # Calculate theoretical size with pruning + INT4 quantization using the fixed function
+    theoretical_pruned_int4_size = calculate_theoretical_quantized_size(
+        qint4_model, bit_width=4
     )
 
-    # Apply PyTorch quantization (CPU-only)
-    pytorch_quantized_model = apply_pytorch_quantization(pytorch_quantized_model)
+    # Apply Quanto INT4 quantization
+    qint4_model = apply_quanto_quantization(qint4_model, is_int4=True)
 
     # Get size of quantized model
-    pytorch_quant_size = get_model_disk_size_in_mb(pytorch_quantized_model)
+    qint4_model_size = get_model_disk_size_in_mb(qint4_model)
 
-    # Evaluate on both splits
+    # Evaluate INT4 model on both splits
+    qint4_results = {}
+
     for split, dataset in [
         ("clean", processed_test_data_clean),
         ("other", processed_test_data_other),
     ]:
-        print(f"\nEvaluating PyTorch quantized model on {split} split...")
+        print(f"\nEvaluating Quanto INT4 quantized model on {split} split...")
 
         # Initialize memory tracker
-        tracker = WhisperMemoryTracker(f"global_pruned_pytorch_quant_{split}", PYTORCH_QUANT_DIR)
+        tracker = WhisperMemoryTracker(f"global_pruned_quanto_int4_{split}", QUANTO_QINT4_DIR)
 
         try:
             # Run evaluation
             scores, transcriptions = evaluate_model(
-                model=pytorch_quantized_model,
+                model=qint4_model,
                 processor=processor,
                 dataset=dataset,
                 metrics=metrics,
@@ -1165,11 +1169,11 @@ def main():
             )
 
             # Store results
-            results[f"global_pruned_pytorch_quant_{split}"] = {
+            qint4_results[split] = {
                 "metrics": scores,
-                "model_size_mb": pytorch_quant_size,
-                "theoretical_pruned_quantized_size_mb": theoretical_pruned_quantized_size,
-                "model_type": "global_pruned_pytorch_quantization",
+                "model_size_mb": qint4_model_size,
+                "theoretical_pruned_int4_size_mb": theoretical_pruned_int4_size,
+                "model_type": "global_pruned_quanto_int4",
                 "pruning_config": pruning_config,
                 "overall_sparsity": overall_sparsity,
                 "weight_sparsity": weight_sparsity,
@@ -1180,39 +1184,131 @@ def main():
 
             # Save metrics
             metrics_path = os.path.join(
-                PYTORCH_QUANT_DIR, f"global_pruned_pytorch_quant_{split}_metrics.json"
+                QUANTO_QINT4_DIR, f"global_pruned_quanto_int4_{split}_metrics.json"
             )
             with open(metrics_path, "w") as f:
-                json.dump(results[f"global_pruned_pytorch_quant_{split}"], f, indent=2)
+                json.dump(qint4_results[split], f, indent=2)
 
             # Save transcriptions
             transcriptions_path = os.path.join(
-                PYTORCH_QUANT_DIR, f"global_pruned_pytorch_quant_{split}_transcriptions.json"
+                QUANTO_QINT4_DIR, f"global_pruned_quanto_int4_{split}_transcriptions.json"
             )
             with open(transcriptions_path, "w") as f:
                 json.dump(transcriptions, f, indent=2)
 
         except Exception as e:
-            print(f"Error evaluating PyTorch quantized model on {split} split: {e}")
+            print(f"Error evaluating Quanto INT4 quantized model on {split} split: {e}")
             continue
 
         finally:
             tracker.close()
 
-    # Save combined results
-    all_results_path = os.path.join(RESULTS_DIR, "global_pruned_pytorch_quantized_results.json")
-    with open(all_results_path, "w") as f:
-        results_to_save = {"global_pruned_baseline": pruned_results, "global_pruned_pytorch_quantized": results}
-        json.dump(results_to_save, f, indent=2)
+    # Save INT4 model
+    qint4_model_path = os.path.join(QUANTO_QINT4_DIR, "global_pruned_quanto_int4_model.pt")
+    torch.save(qint4_model.state_dict(), qint4_model_path)
+    print(f"Saved Quanto INT4 model to {qint4_model_path}")
 
-    # Save pytorch quantized model
-    pytorch_quant_model_path = os.path.join(PYTORCH_QUANT_DIR, "global_pruned_pytorch_quantized_model.pt")
-    torch.save(pytorch_quantized_model.state_dict(), pytorch_quant_model_path)
-    print(f"Saved pytorch quantized model to {pytorch_quant_model_path}")
+    # Step 3: Apply Quanto INT8 quantization to pruned model
+    print("\n" + "=" * 50)
+    print("Applying Quanto INT8 quantization to globally pruned model")
+    print("=" * 50)
+
+    clear_memory()
+
+    # Apply Quanto INT8 quantization to a fresh copy of the pruned model
+    qint8_model = WhisperForConditionalGeneration.from_pretrained(original_model_name)
+    qint8_model.load_state_dict(torch.load(pruned_model_path))
+    qint8_model = qint8_model.to(device)
+    qint8_model.config.forced_decoder_ids = None
+
+    # Calculate theoretical size with pruning + INT8 quantization using the fixed function
+    theoretical_pruned_int8_size = calculate_theoretical_quantized_size(
+        qint8_model, bit_width=8
+    )
+
+    # Apply Quanto INT8 quantization
+    qint8_model = apply_quanto_quantization(qint8_model, is_int4=False)  # INT8
+
+    # Get size of quantized model
+    qint8_model_size = get_model_disk_size_in_mb(qint8_model)
+
+    # Evaluate INT8 model on both splits
+    qint8_results = {}
+
+    for split, dataset in [
+        ("clean", processed_test_data_clean),
+        ("other", processed_test_data_other),
+    ]:
+        print(f"\nEvaluating Quanto INT8 quantized model on {split} split...")
+
+        # Initialize memory tracker
+        tracker = WhisperMemoryTracker(f"global_pruned_quanto_int8_{split}", QUANTO_QINT8_DIR)
+
+        try:
+            # Run evaluation
+            scores, transcriptions = evaluate_model(
+                model=qint8_model,
+                processor=processor,
+                dataset=dataset,
+                metrics=metrics,
+                memory_tracker=tracker,
+                batch_size=batch_size,
+                split=split,
+            )
+
+            # Store results
+            qint8_results[split] = {
+                "metrics": scores,
+                "model_size_mb": qint8_model_size,
+                "theoretical_pruned_int8_size_mb": theoretical_pruned_int8_size,
+                "model_type": "global_pruned_quanto_int8",
+                "pruning_config": pruning_config,
+                "overall_sparsity": overall_sparsity,
+                "weight_sparsity": weight_sparsity,
+                "bias_sparsity": bias_sparsity,
+                "total_parameters": total_params,
+                "non_zero_parameters": overall_non_zero_params,
+            }
+
+            # Save metrics
+            metrics_path = os.path.join(
+                QUANTO_QINT8_DIR, f"global_pruned_quanto_int8_{split}_metrics.json"
+            )
+            with open(metrics_path, "w") as f:
+                json.dump(qint8_results[split], f, indent=2)
+
+            # Save transcriptions
+            transcriptions_path = os.path.join(
+                QUANTO_QINT8_DIR, f"global_pruned_quanto_int8_{split}_transcriptions.json"
+            )
+            with open(transcriptions_path, "w") as f:
+                json.dump(transcriptions, f, indent=2)
+
+        except Exception as e:
+            print(f"Error evaluating Quanto INT8 quantized model on {split} split: {e}")
+            continue
+
+        finally:
+            tracker.close()
+
+    # Save INT8 model
+    qint8_model_path = os.path.join(QUANTO_QINT8_DIR, "global_pruned_quanto_int8_model.pt")
+    torch.save(qint8_model.state_dict(), qint8_model_path)
+    print(f"Saved Quanto INT8 model to {qint8_model_path}")
+
+    # Save combined results
+    all_results_path = os.path.join(RESULTS_DIR, "global_pruned_quanto_quantized_results.json")
+    with open(all_results_path, "w") as f:
+        results_to_save = {
+            "global_pruned_baseline": pruned_results,
+            "global_pruned_quanto_int4": qint4_results,
+            "global_pruned_quanto_int8": qint8_results,
+        }
+        json.dump(results_to_save, f, indent=2)
 
     # Print summary
     print("\n" + "=" * 60)
-    print("GLOBAL PRUNED AND PYTORCH QUANTIZED EXPERIMENT SUMMARY")
+    print("GLOBAL PRUNED AND QUANTO QUANTIZED EXPERIMENT SUMMARY")
     print("=" * 60)
 
     print("\nGlobal Pruned Baseline:")
@@ -1228,10 +1324,10 @@ def main():
             f"  Theoretical Dense Pruned Size: {baseline['theoretical_dense_pruned_size_mb']:.2f} MB"
         )
 
-    print("\nGlobal Pruned + PyTorch Quantized:")
-    key = "global_pruned_pytorch_quant_clean"
-    if key in results:
-        result = results[key]
+    print("\nGlobal Pruned + Quanto INT4:")
+    key = "clean"
+    if key in qint4_results:
+        result = qint4_results[key]
 
         # Calculate changes from pruned baseline
         baseline = pruned_results.get("clean", {})
@@ -1260,15 +1356,54 @@ def main():
         print(f"  RTF: {result['metrics']['RTF']:.6f} (Δ {rtf_change})")
         print(f"  Model Size: {result['model_size_mb']:.2f} MB (Δ {size_change})")
 
-        if "theoretical_pruned_quantized_size_mb" in result:
-            theoretical_change = f"{(result['theoretical_pruned_quantized_size_mb'] - baseline['theoretical_dense_pruned_size_mb']):.2f} MB ({(result['theoretical_pruned_quantized_size_mb'] - baseline['theoretical_dense_pruned_size_mb']) / baseline['theoretical_dense_pruned_size_mb'] * 100:+.2f}%)"
+        if "theoretical_pruned_int4_size_mb" in result:
+            theoretical_change = f"{(result['theoretical_pruned_int4_size_mb'] - baseline['model_size_mb']):.2f} MB ({(result['theoretical_pruned_int4_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%)"
             print(
-                f"  Theoretical Pruned+Quantized Size: {result['theoretical_pruned_quantized_size_mb']:.2f} MB (Δ {theoretical_change})"
+                f"  Theoretical Pruned+INT4 Size: {result['theoretical_pruned_int4_size_mb']:.2f} MB (Δ {theoretical_change})"
+            )
+
+    print("\nGlobal Pruned + Quanto INT8:")
+    key = "clean"
+    if key in qint8_results:
+        result = qint8_results[key]
+
+        # Calculate changes from pruned baseline
+        baseline = pruned_results.get("clean", {})
+        baseline_metrics = baseline.get("metrics", {})
+
+        wer_change = "-"
+        cer_change = "-"
+        rtf_change = "-"
+        size_change = "-"
+
+        if "WER" in result["metrics"] and "WER" in baseline_metrics:
+            wer_change = f"{(result['metrics']['WER'] - baseline_metrics['WER']):.2f} ({(result['metrics']['WER'] - baseline_metrics['WER']) / baseline_metrics['WER'] * 100:+.2f}%)"
+
+        if "CER" in result["metrics"] and "CER" in baseline_metrics:
+            cer_change = f"{(result['metrics']['CER'] - baseline_metrics['CER']):.2f} ({(result['metrics']['CER'] - baseline_metrics['CER']) / baseline_metrics['CER'] * 100:+.2f}%)"
+
+        if "RTF" in result["metrics"] and "RTF" in baseline_metrics:
+            rtf_change = f"{(result['metrics']['RTF'] - baseline_metrics['RTF']):.6f} ({(result['metrics']['RTF'] - baseline_metrics['RTF']) / baseline_metrics['RTF'] * 100:+.2f}%)"
+
+        if "model_size_mb" in result and "model_size_mb" in baseline:
+            size_change = f"{(result['model_size_mb'] - baseline['model_size_mb']):.2f} MB ({(result['model_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%)"
+
+        print(f"  WER: {result['metrics']['WER']:.4f} (Δ {wer_change})")
+        if "CER" in result["metrics"]:
+            print(f"  CER: {result['metrics']['CER']:.4f} (Δ {cer_change})")
+        print(f"  RTF: {result['metrics']['RTF']:.6f} (Δ {rtf_change})")
+        print(f"  Model Size: {result['model_size_mb']:.2f} MB (Δ {size_change})")
+
+        if "theoretical_pruned_int8_size_mb" in result:
+            theoretical_change = f"{(result['theoretical_pruned_int8_size_mb'] - baseline['model_size_mb']):.2f} MB ({(result['theoretical_pruned_int8_size_mb'] - baseline['model_size_mb']) / baseline['model_size_mb'] * 100:+.2f}%)"
+            print(
+                f"  Theoretical Pruned+INT8 Size: {result['theoretical_pruned_int8_size_mb']:.2f} MB (Δ {theoretical_change})"
             )
 
     print("\nResults saved to:", RESULTS_DIR)
     print("  Global Pruned model info:", PRUNED_MODEL_DIR)
-    print("  PyTorch quantized info:", PYTORCH_QUANT_DIR)
+    print("  Quanto INT4 info:", QUANTO_QINT4_DIR)
+    print("  Quanto INT8 info:", QUANTO_QINT8_DIR)
 
 
 if __name__ == "__main__":

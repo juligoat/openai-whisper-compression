@@ -14,6 +14,11 @@ import torch.nn.utils.prune as prune
 from evaluate import load
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
+from optimum.quanto import Calibration, freeze, qfloat8, qint4, qint8, quantize
+import bitsandbytes
+from bitsandbytes.nn import Linear4bit
+
+
 # Set seaborn style
 sns.set(style="whitegrid")
 
@@ -1087,6 +1092,33 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     )  # Use new serialization
     return buffer.getbuffer().nbytes / (1024**2)
 
+def convert_model_to_4bit(
+    model: torch.nn.Module,
+    compute_dtype=torch.float32,
+    quant_type="nf4",
+    double_quant=False,
+) -> torch.nn.Module:
+    """
+    Recursively replace nn.Linear with bitsandbytes.nn.Linear4bit.
+    After this, model.to('cuda') will quantize weights to 4 bits.
+    """
+    for name, child in model.named_children():
+        convert_model_to_4bit(child, compute_dtype, quant_type, double_quant)
+        if isinstance(child, torch.nn.Linear):
+            new = Linear4bit(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                compute_dtype=compute_dtype,
+                quant_type=quant_type,
+                compress_statistics=double_quant,
+                device=child.weight.device,
+            )
+            # copy weights & bias
+            new.load_state_dict(child.state_dict(), strict=False)
+            setattr(model, name, new)
+    return model
+
 
 def main():
     # Configuration to match the quantization code
@@ -1124,8 +1156,8 @@ def main():
 
     # Load full datasets (matching the quantization code)
     print("\nLoading datasets...")
-    dataset_clean = load_librispeech(num_samples=100, split="test.clean")  # Use full test.clean
-    dataset_other = load_librispeech(num_samples=100, split="test.other")  # Use full test.other
+    dataset_clean = load_librispeech(num_samples=2620, split="test.clean")  # Use full test.clean
+    dataset_other = load_librispeech(num_samples=2939, split="test.other")  # Use full test.other
 
     print(f"Clean dataset: {len(dataset_clean)} samples")
     print(f"Other dataset: {len(dataset_other)} samples")
@@ -1149,6 +1181,10 @@ def main():
         "global_pruning": {
             "pruning_config": pruning_config  # Global pruning configuration
         },
+        "global_pruning_bnb": {
+            "pruning_config": pruning_config,  # Global pruning configuration
+            "quantization": "bnb"
+        }
     }
 
     # Evaluate each configuration
@@ -1168,6 +1204,26 @@ def main():
                 pruning_config=config["pruning_config"],
                 make_permanent=True,
             )
+            
+            if config.get("quantization") == "quanto":
+                quantize(model, weights=qint8)
+                freeze(model)
+
+            # Apply PyTorch dynamic quantization
+            if config.get("quantization") == "pytorch":
+                torch.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
+                )
+            
+            if config.get("quantization") == "bnb":
+                model = convert_model_to_4bit(
+                    model,
+                    compute_dtype=torch.float32,
+                    quant_type="nf4",
+                    double_quant=False
+                )
+            
+            model = model.to(device)
 
             # Calculate actual sparsity and parameter counts
             (
