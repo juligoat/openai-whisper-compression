@@ -11,13 +11,10 @@ import psutil
 import seaborn as sns
 import torch
 import torch.nn.utils.prune as prune
-from evaluate import load
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
-
-from optimum.quanto import Calibration, freeze, qfloat8, qint4, qint8, quantize
-import bitsandbytes
 from bitsandbytes.nn import Linear4bit
-
+from evaluate import load
+from optimum.quanto import freeze, qint8, quantize
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 # Set seaborn style
 sns.set(style="whitegrid")
@@ -1092,6 +1089,7 @@ def get_model_disk_size_in_mb(model: torch.nn.Module) -> float:
     )  # Use new serialization
     return buffer.getbuffer().nbytes / (1024**2)
 
+
 def convert_model_to_4bit(
     model: torch.nn.Module,
     compute_dtype=torch.float32,
@@ -1183,8 +1181,8 @@ def main():
         },
         "global_pruning_bnb": {
             "pruning_config": pruning_config,  # Global pruning configuration
-            "quantization": "bnb"
-        }
+            "quantization": "bnb",
+        },
     }
 
     # Evaluate each configuration
@@ -1204,7 +1202,7 @@ def main():
                 pruning_config=config["pruning_config"],
                 make_permanent=True,
             )
-            
+
             if config.get("quantization") == "quanto":
                 quantize(model, weights=qint8)
                 freeze(model)
@@ -1214,15 +1212,12 @@ def main():
                 torch.quantization.quantize_dynamic(
                     model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True
                 )
-            
+
             if config.get("quantization") == "bnb":
                 model = convert_model_to_4bit(
-                    model,
-                    compute_dtype=torch.float32,
-                    quant_type="nf4",
-                    double_quant=False
+                    model, compute_dtype=torch.float32, quant_type="nf4", double_quant=False
                 )
-            
+
             model = model.to(device)
 
             # Calculate actual sparsity and parameter counts

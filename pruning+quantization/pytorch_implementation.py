@@ -258,8 +258,8 @@ def calculate_theoretical_quantized_size(model, pruning_threshold=0.0, int8_quan
         print(f"Original size (FP32): {original_size_mb:.2f} MB")
         print(f"Size after PyTorch quantization (theoretical): {quantized_size_mb:.2f} MB")
         print(f"Overall size reduction: {size_reduction:.1f}%")
-        print(f"Note: This is a theoretical calculation assuming optimal sparse storage")
-        print(f"      The actual quantized model may be larger due to storage format overheads")
+        print("Note: This is a theoretical calculation assuming optimal sparse storage")
+        print("      The actual quantized model may be larger due to storage format overheads")
 
     return quantized_size_mb
 
@@ -987,10 +987,10 @@ def main():
     # Configuration
     original_model_name = "openai/whisper-small"
     batch_size = 16
-    
+
     # Always use CPU for fair comparison between pruned and quantized models
     device = torch.device("cpu")
-    print(f"Using CPU for all evaluations to ensure fair comparison")
+    print("Using CPU for all evaluations to ensure fair comparison")
 
     # Define custom pruning configuration with the specified percentages from the second script
     pruning_config = {
@@ -1102,7 +1102,9 @@ def main():
             }
 
             # Save metrics
-            metrics_path = os.path.join(PRUNED_MODEL_DIR, f"global_pruned_baseline_{split}_metrics.json")
+            metrics_path = os.path.join(
+                PRUNED_MODEL_DIR, f"global_pruned_baseline_{split}_metrics.json"
+            )
             with open(metrics_path, "w") as f:
                 json.dump(pruned_results[split], f, indent=2)
 
@@ -1127,9 +1129,9 @@ def main():
     # Apply PyTorch quantization to a fresh copy of the pruned model
     pytorch_quantized_model = WhisperForConditionalGeneration.from_pretrained(original_model_name)
     pytorch_quantized_model.load_state_dict(torch.load(pruned_model_path))
-    
+
     # Ensure model is on CPU (should already be, but being explicit)
-    pytorch_quantized_model = pytorch_quantized_model.to("cpu") 
+    pytorch_quantized_model = pytorch_quantized_model.to("cpu")
 
     # Calculate theoretical size with pruning + quantization
     theoretical_pruned_quantized_size = calculate_theoretical_quantized_size(
@@ -1202,11 +1204,16 @@ def main():
     # Save combined results
     all_results_path = os.path.join(RESULTS_DIR, "global_pruned_pytorch_quantized_results.json")
     with open(all_results_path, "w") as f:
-        results_to_save = {"global_pruned_baseline": pruned_results, "global_pruned_pytorch_quantized": results}
+        results_to_save = {
+            "global_pruned_baseline": pruned_results,
+            "global_pruned_pytorch_quantized": results,
+        }
         json.dump(results_to_save, f, indent=2)
 
     # Save pytorch quantized model
-    pytorch_quant_model_path = os.path.join(PYTORCH_QUANT_DIR, "global_pruned_pytorch_quantized_model.pt")
+    pytorch_quant_model_path = os.path.join(
+        PYTORCH_QUANT_DIR, "global_pruned_pytorch_quantized_model.pt"
+    )
     torch.save(pytorch_quantized_model.state_dict(), pytorch_quant_model_path)
     print(f"Saved pytorch quantized model to {pytorch_quant_model_path}")
 

@@ -11,8 +11,8 @@ import psutil
 import torch
 import torch.nn.utils.prune as prune
 from evaluate import load
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
 from optimum.quanto import freeze, qint4, qint8, quantize
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 # Create results directory
 RESULTS_DIR = "global_pruning_quanto_quantization_results"
@@ -200,30 +200,30 @@ def calculate_theoretical_quantized_size(model, bit_width=8):
     """
     Calculate the theoretical size of a model after Quanto quantization.
     Takes into account that Quanto quantization keeps the dense format, meaning zeros still take up space.
-    
+
     Args:
         model: The model to quantize (can be pruned or not)
         bit_width: Quantization bit width (4 for INT4, 8 for INT8)
-    
+
     Returns:
         float: Theoretical size in MB after quantization
     """
     print(f"\n=== Calculating theoretical size with Quanto INT{bit_width} quantization ===")
-    
+
     total_bytes = 0
     weight_bytes = 0
     bias_bytes = 0
-    
+
     # Count parameters by type
     total_weight_params = 0
     total_bias_params = 0
-    
+
     # For each parameter in the model
     for name, param in model.named_parameters():
         # Weights are quantized to reduced precision
         if "weight" in name:
             # Each weight uses bit_width bits regardless of whether it's zero or not
-            param_bytes = param.numel() * (bit_width / 8) 
+            param_bytes = param.numel() * (bit_width / 8)
             # Add quantization overhead (scales, zero points) - approximately 0.1% overhead
             param_bytes += param.numel() * (bit_width / 8) * 0.001
             weight_bytes += param_bytes
@@ -233,25 +233,25 @@ def calculate_theoretical_quantized_size(model, bit_width=8):
             param_bytes = param.numel() * 4  # 4 bytes per float32
             bias_bytes += param_bytes
             total_bias_params += param.numel()
-            
+
         total_bytes += param_bytes
-    
+
     # Convert to MB
     total_size_mb = total_bytes / (1024 * 1024)
     weight_size_mb = weight_bytes / (1024 * 1024)
     bias_size_mb = bias_bytes / (1024 * 1024)
-    
+
     # Original FP32 size for comparison
     original_size_mb = (total_weight_params * 4 + total_bias_params * 4) / (1024 * 1024)
     size_reduction = 100.0 * (original_size_mb - total_size_mb) / original_size_mb
-    
+
     # Print size breakdown
     print(f"Original model size (FP32): {original_size_mb:.2f} MB")
     print(f"Theoretical quantized model size: {total_size_mb:.2f} MB")
     print(f"  - Quantized weights ({bit_width}-bit): {weight_size_mb:.2f} MB")
     print(f"  - FP32 biases: {bias_size_mb:.2f} MB")
     print(f"Size reduction: {size_reduction:.1f}%")
-    
+
     return total_size_mb
 
 
@@ -648,11 +648,11 @@ def load_and_prune_whisper_model(model_name, device, pruning_config=None, make_p
 def apply_quanto_quantization(model, is_int4=False):
     """
     Apply Quanto quantization to a model.
-    
+
     Args:
         model: The model to quantize
         is_int4: If True, use INT4 quantization, otherwise use INT8
-    
+
     Returns:
         Quantized model
     """
@@ -662,10 +662,10 @@ def apply_quanto_quantization(model, is_int4=False):
     else:
         print("Applying Quanto INT8 quantization")
         quantize(model, weights=qint8)
-    
+
     # Freeze the model
     freeze(model)
-    
+
     print(f"Quanto {'INT4' if is_int4 else 'INT8'} quantization applied")
     return model
 
@@ -1105,7 +1105,9 @@ def main():
             }
 
             # Save metrics
-            metrics_path = os.path.join(PRUNED_MODEL_DIR, f"global_pruned_baseline_{split}_metrics.json")
+            metrics_path = os.path.join(
+                PRUNED_MODEL_DIR, f"global_pruned_baseline_{split}_metrics.json"
+            )
             with open(metrics_path, "w") as f:
                 json.dump(pruned_results[split], f, indent=2)
 
@@ -1134,9 +1136,7 @@ def main():
     qint4_model.config.forced_decoder_ids = None
 
     # Calculate theoretical size with pruning + INT4 quantization using the fixed function
-    theoretical_pruned_int4_size = calculate_theoretical_quantized_size(
-        qint4_model, bit_width=4
-    )
+    theoretical_pruned_int4_size = calculate_theoretical_quantized_size(qint4_model, bit_width=4)
 
     # Apply Quanto INT4 quantization
     qint4_model = apply_quanto_quantization(qint4_model, is_int4=True)
@@ -1222,9 +1222,7 @@ def main():
     qint8_model.config.forced_decoder_ids = None
 
     # Calculate theoretical size with pruning + INT8 quantization using the fixed function
-    theoretical_pruned_int8_size = calculate_theoretical_quantized_size(
-        qint8_model, bit_width=8
-    )
+    theoretical_pruned_int8_size = calculate_theoretical_quantized_size(qint8_model, bit_width=8)
 
     # Apply Quanto INT8 quantization
     qint8_model = apply_quanto_quantization(qint8_model, is_int4=False)  # INT8
